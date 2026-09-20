@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 7 ]]; then
+  echo "Usage: build-signature-spoof-framework SOURCE_SERVICES_JAR OUTPUT_SERVICES_JAR SOURCE_ROOT SDK_ROOT BAKSMALI_JAR SMALI_JAR PATCH_HELPER" >&2
+  exit 2
+fi
+
+SOURCE_JAR="$(readlink -f -- "$1")"
+OUTPUT_JAR="$2"
+SOURCE_ROOT="$(readlink -f -- "$3")"
+SDK_ROOT="$(readlink -f -- "$4")"
+BAKSMALI_JAR="$(readlink -f -- "$5")"
+SMALI_JAR="$(readlink -f -- "$6")"
+PATCH_HELPER="$(readlink -f -- "$7")"
+EXPECTED_SERVICES="42a658ad7fbfe1b9d7197dd044aba09a686b8a6dfa48620318ac9c03aeeca4d9"
+EXPECTED_CLASSES2="2d3f37029afbd89140986b80684626ecfcac7c6d49ab10c3845634cd23f04258"
+EXPECTED_BAKSMALI="d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5"
+EXPECTED_SMALI="9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116"
+
+BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)"
+PLATFORM="$(find "$SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 -type d -name 'android-*' -printf '%f\n' | sort -V | tail -1)"
+D8="$SDK_ROOT/build-tools/$BUILD_TOOLS/d8"
+ANDROID_JAR="$SDK_ROOT/platforms/$PLATFORM/android.jar"
+
+for command in java javac jar unzip zip sha256sum; do
+  command -v "$command" >/dev/null || { echo "Missing build command: $command" >&2; exit 1; }
+done
+for path in "$SOURCE_JAR" "$BAKSMALI_JAR" "$SMALI_JAR" "$D8" "$ANDROID_JAR" "$PATCH_HELPER"; do
+  [[ -r "$path" ]] || { echo "Missing build input: $path" >&2; exit 1; }
+done
+
+check_hash() {
+  local path="$1" expected="$2" actual
+  actual="$(sha256sum "$path" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || {
+    echo "Unexpected SHA-256 for $path: $actual" >&2
+    exit 1
+  }
+}
+check_hash "$SOURCE_JAR" "$EXPECTED_SERVICES"
+check_hash "$BAKSMALI_JAR" "$EXPECTED_BAKSMALI"
+check_hash "$SMALI_JAR" "$EXPECTED_SMALI"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/jar" "$WORK/services-smali" "$WORK/helper-classes" \
+  "$WORK/helper-dex" "$WORK/helper-smali"
+unzip -q "$SOURCE_JAR" -d "$WORK/jar"
+check_hash "$WORK/jar/classes2.dex" "$EXPECTED_CLASSES2"
+
+java -jar "$BAKSMALI_JAR" disassemble "$WORK/jar/classes2.dex" \
+  -o "$WORK/services-smali"
+find "$SOURCE_ROOT/stubs" "$SOURCE_ROOT/src" -name '*.java' -print0 | \
+  xargs -0 javac -source 8 -target 8 -bootclasspath "$ANDROID_JAR" \
+    -d "$WORK/helper-classes"
+jar --create --file "$WORK/helper.jar" -C "$WORK/helper-classes" \
+  com/android/server/pm/parsing/ReboxedSignatureSpoof.class \
+  -C "$WORK/helper-classes" \
+  com/android/server/pm/parsing/ReboxedWebViewAbi.class
+"$D8" --min-api 35 --lib "$ANDROID_JAR" \
+  --classpath "$WORK/helper-classes" --output "$WORK/helper-dex" "$WORK/helper.jar"
+java -jar "$BAKSMALI_JAR" disassemble "$WORK/helper-dex/classes.dex" \
+  -o "$WORK/helper-smali"
+install -Dm0644 \
+  "$WORK/helper-smali/com/android/server/pm/parsing/ReboxedSignatureSpoof.smali" \
+  "$WORK/services-smali/com/android/server/pm/parsing/ReboxedSignatureSpoof.smali"
+install -Dm0644 \
+  "$WORK/helper-smali/com/android/server/pm/parsing/ReboxedWebViewAbi.smali" \
+  "$WORK/services-smali/com/android/server/pm/parsing/ReboxedWebViewAbi.smali"
+"$PATCH_HELPER" \
+  "$WORK/services-smali/com/android/server/pm/parsing/PackageInfoUtils.smali" \
+  "$WORK/services-smali/com/android/server/pm/ComputerEngine.smali" \
+  "$WORK/services-smali/com/android/server/pm/PackageAbiHelperImpl.smali" \
+  "$WORK/services-smali/com/android/server/pm/ScanPackageUtils.smali"
+java -jar "$SMALI_JAR" assemble "$WORK/services-smali" \
+  -o "$WORK/jar/classes2.dex"
+
+mkdir -p "$(dirname "$OUTPUT_JAR")"
+TEMP_OUTPUT="${OUTPUT_JAR}.tmp.$$"
+cp "$SOURCE_JAR" "$TEMP_OUTPUT"
+(
+  cd "$WORK/jar"
+  zip -q -0 "$TEMP_OUTPUT" classes2.dex
+)
+unzip -tqq "$TEMP_OUTPUT"
+chmod 0644 "$TEMP_OUTPUT"
+mv -f "$TEMP_OUTPUT" "$OUTPUT_JAR"

@@ -1,0 +1,44 @@
+language: c
+os: linux
+sudo: false
+
+addons:
+  apt:
+    sources:
+      - ubuntu-toolchain-r-test
+    packages:
+      - bison
+      - flex
+      - libelf-dev
+      - dpkg-dev
+      - debhelper
+      - dkms
+      - fakeroot
+      - gcc-8
+
+env:
+  - KVER=4.4
+  - KVER=4.8
+  - KVER=4.9
+  - KVER=4.13
+  - KVER=4.14
+  - KVER=4.15
+  - KVER=4.16
+  - KVER=4.17
+  - KVER=5.0 && CC=gcc-8
+  - KVER=5.1 && CC=gcc-8
+  - KVER=5.2 && CC=gcc-8
+  - KVER=5.3 && CC=gcc-8
+  - KVER=5.4 && CC=gcc-8
+  - KVER=master && CC=gcc-8
+
+matrix:
+  allow_failures:
+    - env: KVER=master
+  include:
+  - script:
+    - dpkg-buildpackage -us -uc
+    env: KVER="Debian Package Building"
+
+script:
+  - ./scripts/build-against-kernel.sh ${KVER} ${CC}

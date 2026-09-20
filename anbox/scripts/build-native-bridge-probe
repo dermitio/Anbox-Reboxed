@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  echo "Usage: build-native-bridge-probe SOURCE_DIR OUTPUT_APK SDK_ROOT CLANG" >&2
+}
+[[ $# -eq 4 ]] || { usage; exit 2; }
+
+SOURCE_DIR="$(readlink -f -- "$1")"
+OUTPUT_APK="$2"
+SDK_ROOT="$(readlink -f -- "$3")"
+CLANG="$4"
+BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)"
+PLATFORM="$(find "$SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 -type d -name 'android-*' -printf '%f\n' | sort -V | tail -1)"
+TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS"
+ANDROID_JAR="$SDK_ROOT/platforms/$PLATFORM/android.jar"
+
+for path in "$TOOLS/aapt" "$TOOLS/d8" "$TOOLS/apksigner" "$ANDROID_JAR" "$CLANG"; do
+  [[ -x "$path" || "$path" == "$ANDROID_JAR" && -r "$path" ]] || {
+    echo "Native Bridge probe build dependency is unavailable: $path" >&2
+    exit 1
+  }
+done
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/classes" "$WORK/dex" \
+  "$WORK/package/lib/arm64-v8a" "$WORK/package/lib/armeabi-v7a" \
+  "$(dirname "$OUTPUT_APK")"
+
+"$CLANG" --target=aarch64-linux-android28 -fuse-ld=lld -shared -nostdlib \
+  -fno-stack-protector \
+  -Wl,-soname,libreboxed_native_bridge_probe.so -DREBOXED_PROBE_VALUE=0x640064 \
+  "$SOURCE_DIR/jni/probe.c" -o "$WORK/package/lib/arm64-v8a/libreboxed_native_bridge_probe.so"
+"$CLANG" --target=armv7a-linux-androideabi28 -fuse-ld=lld -shared -nostdlib \
+  -fno-stack-protector \
+  -Wl,-soname,libreboxed_native_bridge_probe.so -DREBOXED_PROBE_VALUE=0x320032 \
+  "$SOURCE_DIR/jni/probe.c" -o "$WORK/package/lib/armeabi-v7a/libreboxed_native_bridge_probe.so"
+
+find "$SOURCE_DIR/src" -name '*.java' -print0 | xargs -0 javac \
+  -source 8 -target 8 -bootclasspath "$ANDROID_JAR" -d "$WORK/classes"
+jar --create --file "$WORK/classes.jar" -C "$WORK/classes" .
+"$TOOLS/d8" --min-api 28 --lib "$ANDROID_JAR" --output "$WORK/dex" "$WORK/classes.jar"
+"$TOOLS/aapt" package -f -M "$SOURCE_DIR/AndroidManifest.xml" -I "$ANDROID_JAR" \
+  -F "$WORK/probe-unsigned.apk"
+cp "$WORK/probe-unsigned.apk" "$WORK/package.apk"
+(
+  cd "$WORK/package"
+  zip -q -9 "$WORK/package.apk" lib/arm64-v8a/libreboxed_native_bridge_probe.so \
+    lib/armeabi-v7a/libreboxed_native_bridge_probe.so
+)
+zip -q -9 -j "$WORK/package.apk" "$WORK/dex/classes.dex"
+
+KEYSTORE="$(dirname "$OUTPUT_APK")/native-bridge-probe.p12"
+if [[ ! -f "$KEYSTORE" ]]; then
+  keytool -genkeypair -noprompt -storetype PKCS12 -keystore "$KEYSTORE" \
+    -storepass android -keypass android -alias reboxed-probe -keyalg RSA -keysize 2048 \
+    -validity 36500 -dname 'CN=Anbox Reboxed Native Bridge Probe,O=Local Build,C=XX' >/dev/null
+fi
+TEMP_OUTPUT="$OUTPUT_APK.tmp"
+"$TOOLS/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android \
+  --ks-key-alias reboxed-probe --out "$TEMP_OUTPUT" "$WORK/package.apk"
+"$TOOLS/apksigner" verify "$TEMP_OUTPUT"
+mv -f "$TEMP_OUTPUT" "$OUTPUT_APK"

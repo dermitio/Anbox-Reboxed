@@ -1,0 +1,4 @@
+# Keep Anbox Reboxed's uinput devices out of the host desktop input stack. Both the
+# stable name and physical path must match so unrelated host devices are never
+# affected.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="anbox-virtual-*", ATTRS{phys}=="anbox/virtual/*", ENV{LIBINPUT_IGNORE_DEVICE}:="1", ENV{ID_INPUT}:="0"

@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Verify that the Android 15 sandboxed WebView renderer survives a page load."""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+class VerifyError(RuntimeError):
+    pass
+
+
+def command(args, check=True):
+    result = subprocess.run(args, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    if check and result.returncode:
+        raise VerifyError("command failed: %s\n%s" %
+                          (" ".join(args), result.stderr.strip()))
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--container-path",
+                        default="/var/lib/anbox/containers")
+    parser.add_argument("--container", default="default")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise VerifyError("run this diagnostic as root")
+
+    attach = ["lxc-attach", "-P", args.container_path,
+              "-n", args.container, "--"]
+    state = command(["lxc-info", "-P", args.container_path,
+                     "-n", args.container, "-sH"]).stdout.strip()
+    if state != "RUNNING":
+        raise VerifyError("Android container is not running")
+
+    def guest(*guest_args, check=True):
+        return command(attach + list(guest_args), check=check)
+
+    package = guest("dumpsys", "package", "com.android.webview").stdout
+    primary = re.search(r"^\s*primaryCpuAbi=(\S+)", package, re.MULTILINE)
+    if not primary or primary.group(1) != "x86_64":
+        raise VerifyError("WebView primaryCpuAbi is not x86_64")
+
+    override = guest("sh", "-c",
+                     "cat /data/local/tmp/webview-command-line 2>/dev/null || true").stdout
+    forbidden = ("--no-sandbox", "--disable-seccomp-filter-sandbox",
+                 "--disable-setuid-sandbox")
+    if any(flag in override for flag in forbidden):
+        raise VerifyError("unsafe WebView sandbox override is active")
+
+    shell = "org.chromium.webview_shell"
+    activity = shell + "/.WebViewBrowserActivity"
+    if not guest("cmd", "package", "path", shell, check=False).stdout.strip():
+        raise VerifyError("the image's WebView shell package is not installed")
+
+    started = guest("date", "+%m-%d %H:%M:%S.000").stdout.strip()
+    guest("am", "force-stop", shell)
+    page = ("data:text/html,<html><body><h1 id='result'>"
+            "REBOXED_WEBVIEW_RENDERER_OK</h1></body></html>")
+    launch = guest("am", "start", "-W", "-n", activity,
+                   "-a", "android.intent.action.VIEW", "-d", page).stdout
+    if "Status: ok" not in launch:
+        raise VerifyError("WebView shell activity did not start successfully")
+
+    renderer_pid = None
+    for _ in range(30):
+        processes = guest("ps", "-A", "-o", "PID,ARGS").stdout.splitlines()
+        for process in processes:
+            fields = process.split(None, 1)
+            if len(fields) == 2 and fields[1].startswith(
+                    "com.android.webview:sandboxed_process"):
+                renderer_pid = fields[0]
+                break
+        if renderer_pid is not None:
+            break
+        time.sleep(0.25)
+    if renderer_pid is None:
+        raise VerifyError("no sandboxed WebView renderer appeared")
+
+    status = guest("cat", "/proc/%s/status" % renderer_pid).stdout
+    executable = guest("readlink", "/proc/%s/exe" % renderer_pid).stdout.strip()
+    if "NoNewPrivs:\t1" not in status or "Seccomp:\t2" not in status:
+        raise VerifyError("renderer is not protected by no-new-privileges and seccomp")
+    if not executable.endswith("/app_process64"):
+        raise VerifyError("renderer is not using the 64-bit app process: " + executable)
+
+    time.sleep(3)
+    live = guest("kill", "-0", renderer_pid, check=False).returncode == 0
+    logs = guest("logcat", "-d", "-v", "threadtime", "-T", started).stdout
+    fatal = re.compile(
+        r"sandboxed_process0.*(?:Fatal signal|signal 31|SIGSYS)|"
+        r"Render process .*crash wasn't handled|"
+        r"crash wasn't handled by all associated\s+webviews",
+        re.IGNORECASE)
+    if not live:
+        raise VerifyError("sandboxed renderer died after loading the page")
+    if fatal.search(logs):
+        raise VerifyError("renderer-crash evidence appeared in logcat")
+
+    print("WEBVIEW_RENDERER_OK|x86_64|NoNewPrivs=1|Seccomp=2|pid=" +
+          renderer_pid)
+    guest("am", "force-stop", shell)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except VerifyError as error:
+        print("webview-renderer: " + str(error), file=sys.stderr)
+        sys.exit(1)

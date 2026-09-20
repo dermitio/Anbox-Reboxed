@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Anbox Reboxed Application Manager
+GenericName=Anbox Reboxed Application Manager
+Version=1.0
+Type=Application
+Icon=${SNAP}/meta/gui/icon.png
+Exec=anbox-reboxed launch --package=org.anbox.appmgr --component=org.anbox.appmgr.AppViewActivity
+Terminal=false

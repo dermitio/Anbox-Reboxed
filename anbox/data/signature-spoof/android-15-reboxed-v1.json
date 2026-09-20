@@ -1,0 +1,28 @@
+{
+  "format": "anbox-reboxed-signature-spoof-v1",
+  "services_jar_sha256": "42a658ad7fbfe1b9d7197dd044aba09a686b8a6dfa48620318ac9c03aeeca4d9",
+  "services_classes2_sha256": "2d3f37029afbd89140986b80684626ecfcac7c6d49ab10c3845634cd23f04258",
+  "baksmali_2_5_2_sha256": "d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5",
+  "smali_2_5_2_sha256": "9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116",
+  "permission": "android.permission.FAKE_PACKAGE_SIGNATURE",
+  "alternate_certificate_sha256": "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83",
+  "webview_abi_compat": {
+    "package": "com.android.webview",
+    "version_code": 661308807,
+    "version_name": "128.0.6613.88",
+    "system_path": "/system/product/app/webview",
+    "apk_sha256": "d8a38cdebf2d49b84889557a4b620ee2adb1f2701b70c8b5af7ac8018209f6d1",
+    "real_certificate_sha256": "a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc",
+    "forced_primary_abi": "x86_64"
+  },
+  "authorized_packages": [
+    {
+      "package": "app.revanced.android.gms",
+      "real_certificate_sha256": "d732e4055c97f8d7a43170a6dc737dc71b6f3e0410940e1b3706c6ade1ff3488"
+    },
+    {
+      "package": "com.android.vending",
+      "real_certificate_sha256": "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+    }
+  ]
+}

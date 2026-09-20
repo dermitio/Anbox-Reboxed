@@ -1,0 +1,34 @@
+{
+  "patch_id": "android15-ranchu-mapper-gfxstream-update-v1",
+  "target_path": "/vendor/lib64/hw/android.hardware.graphics.mapper@3.0-impl-ranchu.so",
+  "architecture": "x86_64",
+  "build_id": "639ce377f5022353a06efebfd9d49d4c",
+  "original_sha256": "98fc966a5b4e3c1aef637804311452c533eb88a5c54e3ef27182d9ead38dc52f",
+  "patched_sha256": "47d67e570cf9c03c16981da2e74b030f9ff8024df94e6c6c18ff5ce658aa578c",
+  "patches": [
+    {
+      "offset": 20746,
+      "expected": "18010000",
+      "replacement": "c8000000",
+      "purpose": "Dispatch the obsolete DMA-only upload through the Android 15 rcUpdateColorBuffer encoder slot"
+    }
+  ],
+  "additional_targets": [
+    {
+      "target_path": "/vendor/lib64/egl/libEGL_emulation.so",
+      "architecture": "x86_64",
+      "android_abi": 35,
+      "build_id": "f8d403ca4d56b6982f0f589babfb21e5",
+      "original_sha256": "4c03975e818be8d35c8c65c4b81001511b569a1f736f8daed299e27fe960f9ec",
+      "patched_sha256": "8966813e18793c08109e99b8a9ef7b8968531bca443b9f5c51b3ae5964ad96f0",
+      "patches": [
+        {
+          "offset": 62459,
+          "expected": "e820a200004885c00f8497feffff488b00",
+          "replacement": "4c89f789ee41ff9688000000e994feffff",
+          "purpose": "Use the synchronous window ColorBuffer flush when no native fence device exists instead of a whole-context glFinish"
+        }
+      ]
+    }
+  ]
+}

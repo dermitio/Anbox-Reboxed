@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Install exact-build Android 15 guest gfxstream compatibility overlays."""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+OVERLAY_ROOT = "state/vendor-gfxstream-compat"
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest_path():
+    candidates = [
+        os.environ.get("ANBOX_GFXSTREAM_COMPAT_MANIFEST", ""),
+        "/usr/local/share/anbox/android-gfxstream-compat-v1.json",
+        "/usr/share/anbox/android-gfxstream-compat-v1.json",
+        os.path.join(os.path.dirname(__file__), "..", "data",
+                     "android-gfxstream-compat-v1.json"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            with open(candidate, encoding="utf-8") as stream:
+                return json.load(stream)
+    raise ValueError("gfxstream compatibility manifest is not installed")
+
+
+def validate_elf(path, manifest, expected_hash):
+    with open(path, "rb") as stream:
+        data = stream.read()
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        raise ValueError("target is not a little-endian ELF64 object")
+    if struct.unpack_from("<H", data, 18)[0] != 62:
+        raise ValueError("target ELF is not x86_64")
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected_hash:
+        raise ValueError("unsupported target SHA-256 " + actual)
+    # The exact hash is authoritative; retaining the Build ID in diagnostics
+    # makes failures understandable without weakening validation.
+    if bytes.fromhex(manifest["build_id"]) not in data:
+        raise ValueError("expected ELF Build ID is absent")
+    return actual
+
+
+def targets(manifest):
+    return [manifest] + manifest.get("additional_targets", [])
+
+
+def find_source(args, temporary, manifest):
+    target = manifest["target_path"].removeprefix("/vendor/")
+    if args.source and os.path.basename(args.source) == os.path.basename(target):
+        if not os.path.isfile(args.source):
+            raise ValueError("gfxstream source is unavailable: " + args.source)
+        return args.source
+    mounted = os.path.join(args.data_dir, "vendor-rootfs", target)
+    if os.path.isfile(mounted):
+        return mounted
+    image = args.vendor_image or os.path.join(args.data_dir, "vendor.img")
+    if not os.path.isfile(image):
+        raise ValueError("vendor image is unavailable")
+    extracted = os.path.join(temporary, os.path.basename(target))
+    result = subprocess.run(
+        ["debugfs", "-R", "dump -p /" + target + " " + extracted, image],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode or not os.path.isfile(extracted):
+        raise ValueError("failed to extract gfxstream target from vendor image: " +
+                         result.stderr.strip())
+    return extracted
+
+
+def overlay_path(data_dir, manifest):
+    relative = manifest["target_path"].removeprefix("/vendor/")
+    return os.path.join(data_dir, OVERLAY_ROOT, relative)
+
+
+def bind_line(data_dir, manifest):
+    overlay = overlay_path(data_dir, manifest)
+    target = os.path.join(data_dir, "combined-rootfs",
+                          manifest["target_path"].lstrip("/"))
+    return "%s %s none bind,optional,ro 0 0" % (overlay, target)
+
+
+def update_bindtab(data_dir, manifest, enable):
+    path = os.path.join(data_dir, "bindtab")
+    lines = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as stream:
+            lines = [line.rstrip("\n") for line in stream]
+    lines = [line for line in lines if "/state/vendor-gfxstream-compat/" not in line]
+    if enable:
+        lines.extend(bind_line(data_dir, target) for target in targets(manifest))
+    temporary = path + ".gfxstream-compat.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        for line in lines:
+            stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def reset(args, manifest):
+    update_bindtab(args.data_dir, manifest, False)
+    root = os.path.join(args.data_dir, OVERLAY_ROOT)
+    if os.path.isdir(root):
+        shutil.rmtree(root)
+    print("gfxstream compatibility overlays reset; vendor image was not modified")
+
+
+def apply(args, manifest, quiet=False):
+    with tempfile.TemporaryDirectory(prefix="anbox-gfxstream-compat-") as temporary:
+        prepared = []
+        for target in targets(manifest):
+            source = find_source(args, temporary, target)
+            original_hash = validate_elf(
+                source, target, target["original_sha256"])
+            prepared.append((target, source, original_hash))
+        current = all(
+            os.path.isfile(overlay_path(args.data_dir, target)) and
+            sha256(overlay_path(args.data_dir, target)) == target["patched_sha256"]
+            for target, _, _ in prepared)
+        if current:
+            update_bindtab(args.data_dir, manifest, True)
+            if not quiet:
+                print("gfxstream compatibility overlays already current")
+            return
+        root = os.path.join(args.data_dir, OVERLAY_ROOT)
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        for target, source, _ in prepared:
+            output = overlay_path(args.data_dir, target)
+            os.makedirs(os.path.dirname(output), mode=0o755, exist_ok=True)
+            candidate = output + ".tmp"
+            try:
+                with open(source, "rb") as stream:
+                    data = bytearray(stream.read())
+                for change in target["patches"]:
+                    offset = change["offset"]
+                    expected = bytes.fromhex(change["expected"])
+                    replacement = bytes.fromhex(change["replacement"])
+                    if len(expected) != len(replacement):
+                        raise ValueError("patch changes target file size")
+                    if data[offset:offset + len(expected)] != expected:
+                        raise ValueError(
+                            "%s: instruction validation failed at offset 0x%x" %
+                            (target["target_path"], offset))
+                    data[offset:offset + len(expected)] = replacement
+                with open(candidate, "wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(candidate, 0o644)
+                validate_elf(candidate, target, target["patched_sha256"])
+                os.replace(candidate, output)
+            finally:
+                if os.path.exists(candidate):
+                    os.unlink(candidate)
+        update_bindtab(args.data_dir, manifest, True)
+        if not quiet:
+            print("gfxstream compatibility overlays applied")
+            for target, _, original_hash in prepared:
+                print("target: " + target["target_path"])
+                print("  original-sha256: " + original_hash)
+                print("  patched-sha256: " +
+                      sha256(overlay_path(args.data_dir, target)))
+                print("  build-id: " + target["build_id"])
+
+
+def status(args, manifest):
+    configured_lines = set()
+    bindtab = os.path.join(args.data_dir, "bindtab")
+    if os.path.isfile(bindtab):
+        with open(bindtab, encoding="utf-8") as stream:
+            configured_lines = {line.rstrip("\n") for line in stream}
+    print("patch-id: " + manifest["patch_id"])
+    success = True
+    with tempfile.TemporaryDirectory(prefix="anbox-gfxstream-status-") as temporary:
+        for target in targets(manifest):
+            validation = "none"
+            supported = False
+            original_hash = "unavailable"
+            try:
+                source = find_source(args, temporary, target)
+                original_hash = validate_elf(
+                    source, target, target["original_sha256"])
+                supported = True
+            except Exception as error:
+                validation = str(error)
+            output = overlay_path(args.data_dir, target)
+            patched_hash = sha256(output) if os.path.isfile(output) else "absent"
+            active = patched_hash == target["patched_sha256"]
+            configured = bind_line(args.data_dir, target) in configured_lines
+            print("target: " + target["target_path"])
+            print("  build-id: " + target["build_id"])
+            print("  supported: " + str(supported).lower())
+            print("  overlay-active: " + str(active).lower())
+            print("  bind-configured: " + str(configured).lower())
+            print("  original-sha256: " + original_hash)
+            print("  patched-sha256: " + patched_hash)
+            print("  validation-failure: " + validation)
+            success = success and supported and active and configured
+    return 0 if success else 1
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("status", "apply", "auto", "reset"))
+    parser.add_argument("--data-dir", default="/var/lib/anbox")
+    parser.add_argument("--vendor-image")
+    parser.add_argument("--source")
+    args = parser.parse_args()
+    manifest = manifest_path()
+    try:
+        if args.action == "status":
+            return status(args, manifest)
+        if args.action == "reset":
+            reset(args, manifest)
+            return 0
+        apply(args, manifest, quiet=args.action == "auto")
+        return 0
+    except Exception as error:
+        try:
+            update_bindtab(args.data_dir, manifest, False)
+            root = os.path.join(args.data_dir, OVERLAY_ROOT)
+            if os.path.isdir(root):
+                shutil.rmtree(root)
+        except Exception:
+            pass
+        print("gfxstream compatibility validation failed: " + str(error),
+              file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

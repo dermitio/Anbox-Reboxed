@@ -1,0 +1,42 @@
+#!/system/bin/sh
+set -eu
+
+/apex/com.android.sdkext/bin/derive_classpath
+
+classpath=/data/system/environ/classpath
+stub=/system/framework/anbox-ondevicepersonalization-stub.jar
+
+append_classpath_stub() {
+    name="$1"
+    if grep -q "^export ${name} .*${stub}" "${classpath}"; then
+        return
+    fi
+    sed -i "s#^export ${name} \\(.*\\)#export ${name} \\1:${stub}#" "${classpath}"
+}
+
+add_systemserver_stub() {
+    name=SYSTEMSERVERCLASSPATH
+    odp_service=/apex/com.android.ondevicepersonalization/javalib/service-ondevicepersonalization.jar
+
+    if grep -q "^export ${name} .*${stub}" "${classpath}"; then
+        return
+    fi
+    if grep -q "^export ${name} .*${odp_service}" "${classpath}"; then
+        sed -i "s#${odp_service}#${stub}:${odp_service}#" "${classpath}"
+        return
+    fi
+    append_classpath_stub "${name}"
+}
+
+if [ -f "${classpath}" ] && [ -f "${stub}" ]; then
+    # Keep the Anbox OnDevicePersonalization compatibility stub out of
+    # BOOTCLASSPATH. Android's precompiled boot image artifacts must match the
+    # real framework/APEX boot classpath component set; appending this stub
+    # changes the runtime component count and can make zygote reject
+    # boot-framework-adservices.art before preload completes.
+    #
+    # system_server still needs the stub because it loads
+    # OnDevicePersonalizationSystemService$Lifecycle from the system-server
+    # classloader.
+    add_systemserver_stub
+fi

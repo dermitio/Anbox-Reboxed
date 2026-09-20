@@ -1,0 +1,8 @@
+PACKAGE_NAME="anbox"
+PACKAGE_VERSION="1"
+CLEAN="make -C ashmem clean"
+MAKE[0]="'make' -j$parallel_jobs -C ashmem KERNEL_SRC=$kernel_source_dir"
+BUILT_MODULE_NAME[0]="ashmem_linux"
+BUILT_MODULE_LOCATION[0]="ashmem"
+DEST_MODULE_LOCATION[0]="/updates"
+AUTOINSTALL="yes"

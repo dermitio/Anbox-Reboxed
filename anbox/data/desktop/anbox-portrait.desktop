@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Anbox Reboxed — Portrait
+GenericName=Anbox Reboxed Android Runtime
+Comment=Start Anbox Reboxed in portrait orientation
+Exec=anbox-reboxed-window --orientation portrait
+Icon=anbox-reboxed
+Terminal=false
+Type=Application
+Categories=System;Emulator;
+StartupNotify=true

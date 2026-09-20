@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+IMAGE="${1:-}"
+PACKAGE=org.anbox.reboxed.bridge
+APK_PATH=/system/priv-app/ReboxedBridge/ReboxedBridge.apk
+APK_DIR=/system/priv-app/ReboxedBridge
+PRIVAPP_XML=/system/etc/permissions/privapp-permissions-reboxed-bridge.xml
+SHARED_UID_XML=/system/etc/permissions/package-shareduid-allowlist-reboxed-bridge.xml
+
+die() { echo "ERROR: Reboxed Bridge image verification failed: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command missing: $1"; }
+
+[[ -n "$IMAGE" ]] || die "usage: $0 <system-image>"
+[[ -r "$IMAGE" ]] || die "image is not readable: $IMAGE"
+need debugfs
+need keytool
+need grep
+need awk
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+inode_stat() {
+  local path="$1" output
+  output="$(debugfs -R "stat $path" "$IMAGE" 2>&1)"
+  [[ "$output" != *"File not found"* && "$output" == *"Inode:"* ]] ||
+    die "required preload path is missing: $path"
+  printf '%s\n' "$output"
+}
+
+verify_inode() {
+  local path="$1" type="$2" mode="$3" output
+  output="$(inode_stat "$path")"
+  grep -Eq "Type: ${type}[[:space:]]+Mode:[[:space:]]+${mode}([[:space:]]|$)" <<<"$output" ||
+    die "$path must be a $type with mode $mode"
+  grep -Eq 'User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)' <<<"$output" ||
+    die "$path must be owned by root:root"
+}
+
+dump_file() {
+  local source="$1" target="$2" output
+  output="$(debugfs -R "dump $source $target" "$IMAGE" 2>&1)"
+  [[ -s "$target" ]] || die "could not extract $source: $output"
+}
+
+apk_cert_sha256() {
+  local apk="$1"
+  keytool -printcert -jarfile "$apk" 2>/dev/null |
+    awk '/SHA256:/{fingerprint=$2; gsub(":", "", fingerprint); print tolower(fingerprint); exit}'
+}
+
+verify_inode "$APK_DIR" directory 0755
+verify_inode "$APK_PATH" regular 0644
+verify_inode "$PRIVAPP_XML" regular 0644
+verify_inode "$SHARED_UID_XML" regular 0644
+
+dump_file "$APK_PATH" "$work/ReboxedBridge.apk"
+dump_file /system/framework/framework-res.apk "$work/framework-res.apk"
+dump_file "$PRIVAPP_XML" "$work/privapp.xml"
+dump_file "$SHARED_UID_XML" "$work/shared-uid.xml"
+
+grep -Fq "package=\"$PACKAGE\"" "$work/privapp.xml" ||
+  die "$PRIVAPP_XML does not allowlist $PACKAGE"
+grep -Fq 'android.permission.INSTALL_PACKAGES' "$work/privapp.xml" ||
+  die "$PRIVAPP_XML does not grant android.permission.INSTALL_PACKAGES"
+grep -Fq "package=\"$PACKAGE\"" "$work/shared-uid.xml" ||
+  die "$SHARED_UID_XML does not allowlist $PACKAGE"
+grep -Fq 'shareduid="android.uid.system"' "$work/shared-uid.xml" ||
+  die "$SHARED_UID_XML does not allow android.uid.system"
+
+bridge_cert="$(apk_cert_sha256 "$work/ReboxedBridge.apk")"
+platform_cert="$(apk_cert_sha256 "$work/framework-res.apk")"
+[[ -n "$bridge_cert" ]] || die "ReboxedBridge.apk has no readable signing certificate"
+[[ -n "$platform_cert" ]] || die "framework-res.apk has no readable platform certificate"
+[[ "$bridge_cert" == "$platform_cert" ]] ||
+  die "APK signature does not match the image platform certificate (bridge=$bridge_cert platform=$platform_cert)"
+
+echo "Reboxed Bridge preload verified: $APK_PATH (platform certificate $bridge_cert)"

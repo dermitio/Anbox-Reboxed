@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+TARGET = "/vendor/lib64/libGLESv2_enc.so"
+OVERLAY_REL = "state/vendor-gles-compat/lib64/libGLESv2_enc.so"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sections(data):
+    header = struct.unpack_from("<16sHHIQQQIHHHHHH", data, 0)
+    if header[0][:4] != b"\x7fELF" or header[0][4] != 2 or header[0][5] != 1:
+        raise ValueError("not a little-endian ELF64 object")
+    if header[2] != 62:
+        raise ValueError("ELF machine is not x86_64")
+    shoff, shentsize, shnum, shstrndx = header[6], header[11], header[12], header[13]
+    raw = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize)
+           for i in range(shnum)]
+    names_hdr = raw[shstrndx]
+    names = data[names_hdr[4]:names_hdr[4] + names_hdr[5]]
+    result = {}
+    for item in raw:
+        end = names.find(b"\0", item[0])
+        result[names[item[0]:end].decode("ascii")] = item
+    return result
+
+
+def note_value(data, section, expected_name, expected_type):
+    pos, end = section[4], section[4] + section[5]
+    while pos + 12 <= end:
+        namesz, descsz, note_type = struct.unpack_from("<III", data, pos)
+        pos += 12
+        name = data[pos:pos + namesz].rstrip(b"\0")
+        pos = (pos + namesz + 3) & ~3
+        desc = data[pos:pos + descsz]
+        pos = (pos + descsz + 3) & ~3
+        if name == expected_name and note_type == expected_type:
+            return desc
+    raise ValueError("required ELF note is absent")
+
+
+def inspect_elf(path, manifest):
+    with open(path, "rb") as stream:
+        data = stream.read()
+    table = sections(data)
+    build_id = note_value(data, table[".note.gnu.build-id"], b"GNU", 3).hex()
+    abi_desc = note_value(data, table[".note.android.ident"], b"Android", 1)
+    abi = struct.unpack_from("<I", abi_desc)[0]
+    dynsym, dynstr = table[".dynsym"], table[".dynstr"]
+    strings = data[dynstr[4]:dynstr[4] + dynstr[5]]
+    symbol = None
+    for pos in range(dynsym[4], dynsym[4] + dynsym[5], dynsym[9]):
+        name_off, info, other, shndx, value, size = struct.unpack_from("<IBBHQQ", data, pos)
+        end = strings.find(b"\0", name_off)
+        name = strings[name_off:end].decode("ascii", errors="replace")
+        if name == manifest["symbol"]:
+            symbol = (value, size)
+            break
+    if symbol is None:
+        raise ValueError("target encoder symbol is absent")
+    if build_id != manifest["build_id"]:
+        raise ValueError("unsupported Build ID " + build_id)
+    if abi != manifest["android_abi"]:
+        raise ValueError("unsupported Android ABI " + str(abi))
+    if symbol != (manifest["symbol_value"], manifest["symbol_size"]):
+        raise ValueError("target symbol location or size does not match manifest")
+    return {"architecture": "x86_64", "android_abi": abi,
+            "build_id": build_id, "symbol_value": symbol[0], "symbol_size": symbol[1]}
+
+
+def patch_bytes(original, output, manifest):
+    with open(original, "rb") as stream:
+        data = bytearray(stream.read())
+    for patch in manifest["patches"]:
+        offset = patch["offset"]
+        expected = bytes.fromhex(patch["expected"])
+        replacement = bytes.fromhex(patch["replacement"])
+        if len(expected) != len(replacement):
+            raise ValueError("manifest patch changes file size")
+        if data[offset:offset + len(expected)] != expected:
+            raise ValueError("instruction validation failed at offset 0x%x" % offset)
+        data[offset:offset + len(expected)] = replacement
+    with open(output, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(output, 0o644)
+
+
+def manifest_path():
+    candidates = [
+        os.environ.get("ANBOX_GLES_COMPAT_MANIFEST", ""),
+        "/usr/local/share/anbox/android-gles-compat-v1.json",
+        "/usr/share/anbox/android-gles-compat-v1.json",
+        os.path.join(os.path.dirname(__file__), "..", "data", "android-gles-compat-v1.json"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.realpath(candidate)
+    raise ValueError("GLES compatibility manifest is not installed")
+
+
+def load_manifest():
+    with open(manifest_path(), encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def replacement_root():
+    candidates = [
+        os.environ.get("ANBOX_GLES_COMPAT_REPLACEMENTS", ""),
+        "/usr/local/share/anbox/gles-compat",
+        "/usr/share/anbox/gles-compat",
+        os.path.join(os.path.dirname(__file__), "..", "data", "gles-compat"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return os.path.realpath(candidate)
+    raise ValueError(
+        "GLES replacement library set is not installed; supply the matching "
+        "external bundle via ANBOX_GLES_COMPAT_REPLACEMENTS "
+        "(see docs/public-build.md)")
+
+
+def inspect_basic_elf(path, entry, expected_hash, expected_build_id):
+    with open(path, "rb") as stream:
+        data = stream.read()
+    table = sections(data)
+    build_id = note_value(data, table[".note.gnu.build-id"], b"GNU", 3).hex()
+    abi_desc = note_value(data, table[".note.android.ident"], b"Android", 1)
+    abi = struct.unpack_from("<I", abi_desc)[0]
+    actual_hash = hashlib.sha256(data).hexdigest()
+    if abi != entry["android_abi"]:
+        raise ValueError("%s: unsupported Android ABI %s" % (entry["target_path"], abi))
+    if build_id != expected_build_id:
+        raise ValueError("%s: unexpected Build ID %s" % (entry["target_path"], build_id))
+    if actual_hash != expected_hash:
+        raise ValueError("%s: unexpected SHA-256 %s" % (entry["target_path"], actual_hash))
+    return {"architecture": "x86_64", "android_abi": abi,
+            "build_id": build_id, "sha256": actual_hash}
+
+
+def replacement_entries(manifest):
+    return manifest.get("replacement_libraries", [])
+
+
+def apply_replacements(args, manifest, quiet=False):
+    entries = replacement_entries(manifest)
+    targets = tuple(entry["target_path"] for entry in entries)
+    root = replacement_root()
+    with tempfile.TemporaryDirectory(prefix="anbox-gles-replace-") as temporary:
+        prepared = []
+        for entry in entries:
+            original = find_source(args, temporary, entry["target_path"])
+            inspect_basic_elf(original, entry, entry["original_sha256"],
+                              entry["original_build_id"])
+            replacement = os.path.join(root, entry["replacement_file"])
+            inspect_basic_elf(replacement, entry, entry["replacement_sha256"],
+                              entry["replacement_build_id"])
+            prepared.append((entry, replacement))
+        current = all(
+            os.path.isfile(os.path.join(args.data_dir, overlay_rel(entry["target_path"]))) and
+            sha256(os.path.join(args.data_dir, overlay_rel(entry["target_path"]))) ==
+            entry["replacement_sha256"] for entry, _ in prepared)
+        overlay_root = os.path.join(args.data_dir, "state", "vendor-gles-compat")
+        expected_outputs = {
+            os.path.realpath(os.path.join(args.data_dir, overlay_rel(entry["target_path"])))
+            for entry, _ in prepared
+        }
+        existing_outputs = set()
+        if os.path.isdir(overlay_root):
+            for directory, _, files in os.walk(overlay_root):
+                existing_outputs.update(os.path.realpath(os.path.join(directory, name))
+                                        for name in files)
+        current = current and existing_outputs == expected_outputs
+        if current:
+            update_bindtab(args.data_dir, True, targets)
+            if not quiet:
+                print("GLES replacement overlay already current")
+            return
+        if os.path.isdir(overlay_root):
+            shutil.rmtree(overlay_root)
+        for entry, replacement in prepared:
+            output = os.path.join(args.data_dir, overlay_rel(entry["target_path"]))
+            os.makedirs(os.path.dirname(output), mode=0o755, exist_ok=True)
+            if os.path.isfile(output) and sha256(output) == entry["replacement_sha256"]:
+                continue
+            candidate = output + ".tmp"
+            shutil.copyfile(replacement, candidate)
+            os.chmod(candidate, 0o644)
+            os.replace(candidate, output)
+        update_bindtab(args.data_dir, True, targets)
+    if not quiet:
+        print("GLES replacement overlay applied (%d libraries)" % len(entries))
+
+
+def status_replacements(args, manifest):
+    entries = replacement_entries(manifest)
+    targets = tuple(entry["target_path"] for entry in entries)
+    failures = []
+    configured_lines = set()
+    bindtab = os.path.join(args.data_dir, "bindtab")
+    if os.path.isfile(bindtab):
+        with open(bindtab, encoding="utf-8") as stream:
+            configured_lines = {line.rstrip("\n") for line in stream}
+    print("patch-id: " + manifest["patch_id"])
+    print("source-tag: " + manifest["source_tag"])
+    for entry in entries:
+        target = entry["target_path"]
+        validation = "none"
+        supported = False
+        detected_build = "unknown"
+        detected_hash = "unavailable"
+        try:
+            with tempfile.TemporaryDirectory(prefix="anbox-gles-status-") as temporary:
+                original = find_source(args, temporary, target)
+                info = inspect_basic_elf(original, entry, entry["original_sha256"],
+                                         entry["original_build_id"])
+                supported = True
+                detected_build = info["build_id"]
+                detected_hash = info["sha256"]
+        except Exception as error:
+            validation = str(error)
+            failures.append(validation)
+        overlay = os.path.join(args.data_dir, overlay_rel(target))
+        overlay_hash = sha256(overlay) if os.path.isfile(overlay) else "absent"
+        active = overlay_hash == entry["replacement_sha256"]
+        configured = bind_line(args.data_dir, target) in configured_lines
+        print("library: " + target)
+        print("  detected-build-id: " + detected_build)
+        print("  supported: " + str(supported).lower())
+        print("  overlay-active: " + str(active).lower())
+        print("  bind-configured: " + str(configured).lower())
+        print("  original-sha256: " + detected_hash)
+        print("  replacement-sha256: " + overlay_hash)
+        print("  expected-replacement-sha256: " + entry["replacement_sha256"])
+        print("  validation-failure: " + validation)
+    return 0 if not failures else 1
+
+
+def find_source(args, temporary, target=TARGET):
+    if args.source:
+        if target == TARGET:
+            return args.source
+        sibling = os.path.join(os.path.dirname(args.source), os.path.basename(target))
+        if os.path.isfile(sibling):
+            return sibling
+    mounted = os.path.join(args.data_dir, "vendor-rootfs",
+                           target.removeprefix("/vendor/"))
+    if os.path.isfile(mounted):
+        return mounted
+    image = args.vendor_image or os.path.join(args.data_dir, "vendor.img")
+    if not os.path.isfile(image):
+        raise ValueError("vendor image is unavailable")
+    extracted = os.path.join(temporary, os.path.basename(target))
+    command = ["debugfs", "-R", "dump -p /" + target.removeprefix("/vendor/") + " " + extracted, image]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode or not os.path.isfile(extracted):
+        raise ValueError("failed to extract encoder from vendor image: " + result.stderr.strip())
+    return extracted
+
+
+def overlay_rel(target):
+    return os.path.join("state/vendor-gles-compat", target.removeprefix("/vendor/"))
+
+
+def bind_line(data_dir, target=TARGET):
+    overlay = os.path.join(data_dir, overlay_rel(target))
+    # This Anbox Reboxed LXC configuration uses host-visible combined-rootfs targets
+    # for late file overlays (the same convention as anbox.prop). Binding to
+    # the container spelling directly is accepted by LXC but remains optional
+    # and is silently skipped before pivot_root.
+    mount_target = os.path.join(data_dir, "combined-rootfs", target.lstrip("/"))
+    return "%s %s none bind,optional,ro 0 0" % (overlay, mount_target)
+
+
+def update_bindtab(data_dir, enable, targets=(TARGET,)):
+    path = os.path.join(data_dir, "bindtab")
+    wanted = [bind_line(data_dir, target) for target in targets]
+    lines = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as stream:
+            lines = [line.rstrip("\n") for line in stream]
+    lines = [line for line in lines
+             if "vendor-gles-compat" not in line]
+    if enable:
+        lines.extend(wanted)
+    temporary = path + ".gles-compat.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        for line in lines:
+            stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def reset(args):
+    update_bindtab(args.data_dir, False)
+    root = os.path.join(args.data_dir, "state", "vendor-gles-compat")
+    if os.path.isdir(root):
+        shutil.rmtree(root)
+    print("GLES compatibility overlay reset; vendor image was not modified")
+
+
+def apply(args, quiet=False):
+    manifest = load_manifest()
+    if replacement_entries(manifest):
+        return apply_replacements(args, manifest, quiet)
+    overlay = os.path.join(args.data_dir, OVERLAY_REL)
+    os.makedirs(os.path.dirname(overlay), mode=0o755, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="anbox-gles-compat-") as temporary:
+        original = find_source(args, temporary)
+        info = inspect_elf(original, manifest)
+        original_hash = sha256(original)
+        if original_hash != manifest["original_sha256"]:
+            raise ValueError("unsupported original SHA-256 " + original_hash)
+        if os.path.isfile(overlay) and sha256(overlay) == manifest["patched_sha256"]:
+            update_bindtab(args.data_dir, True)
+            if not quiet:
+                print("GLES compatibility overlay already current")
+            return
+        if os.path.exists(overlay):
+            os.unlink(overlay)
+        candidate = overlay + ".tmp"
+        try:
+            patch_bytes(original, candidate, manifest)
+            inspect_elf(candidate, manifest)
+            patched_hash = sha256(candidate)
+            if patched_hash != manifest["patched_sha256"]:
+                raise ValueError("patched SHA-256 validation failed: " + patched_hash)
+            os.replace(candidate, overlay)
+            update_bindtab(args.data_dir, True)
+        finally:
+            if os.path.exists(candidate):
+                os.unlink(candidate)
+        if not quiet:
+            print("GLES compatibility overlay applied")
+            print("original-sha256: " + original_hash)
+            print("patched-sha256: " + sha256(overlay))
+            print("build-id: " + info["build_id"])
+
+
+def status(args):
+    manifest = load_manifest()
+    if replacement_entries(manifest):
+        return status_replacements(args, manifest)
+    overlay = os.path.join(args.data_dir, OVERLAY_REL)
+    validation = "none"
+    supported = False
+    detected = {}
+    original_hash = "unavailable"
+    try:
+        with tempfile.TemporaryDirectory(prefix="anbox-gles-status-") as temporary:
+            original = find_source(args, temporary)
+            original_hash = sha256(original)
+            detected = inspect_elf(original, manifest)
+            supported = original_hash == manifest["original_sha256"]
+            if not supported:
+                validation = "unsupported original SHA-256"
+    except Exception as error:
+        validation = str(error)
+    overlay_hash = sha256(overlay) if os.path.isfile(overlay) else "absent"
+    overlay_active = overlay_hash == manifest["patched_sha256"]
+    bindtab = os.path.join(args.data_dir, "bindtab")
+    configured = False
+    if os.path.isfile(bindtab):
+        with open(bindtab, encoding="utf-8") as stream:
+            configured = bind_line(args.data_dir) in [line.rstrip("\n") for line in stream]
+    config_path = os.path.join(args.data_dir, "containers", "default", "config")
+    mounted = False
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8", errors="replace") as stream:
+            mounted = bind_line(args.data_dir).split(" none ")[0] in stream.read()
+    print("target: " + TARGET)
+    print("architecture: " + detected.get("architecture", "unknown"))
+    print("android-abi: " + str(detected.get("android_abi", "unknown")))
+    print("build-id: " + detected.get("build_id", "unknown"))
+    print("supported: " + str(supported).lower())
+    print("overlay-active: " + str(overlay_active).lower())
+    print("bind-configured: " + str(configured).lower())
+    print("bind-generated: " + str(mounted).lower())
+    print("original-sha256: " + original_hash)
+    print("patched-sha256: " + overlay_hash)
+    print("expected-patched-sha256: " + manifest["patched_sha256"])
+    print("validation-failure: " + validation)
+    return 0 if supported and (not os.path.isfile(overlay) or overlay_active) else 1
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("status", "apply", "auto", "reset"))
+    parser.add_argument("--data-dir", default="/var/lib/anbox")
+    parser.add_argument("--vendor-image")
+    parser.add_argument("--source")
+    args = parser.parse_args()
+    try:
+        if args.action == "status":
+            return status(args)
+        if args.action == "reset":
+            reset(args)
+            return 0
+        apply(args, quiet=args.action == "auto")
+        return 0
+    except Exception as error:
+        overlay = os.path.join(args.data_dir, "state", "vendor-gles-compat")
+        try:
+            update_bindtab(args.data_dir, False)
+            if os.path.isdir(overlay):
+                shutil.rmtree(overlay)
+        except Exception:
+            pass
+        print("GLES compatibility validation failed: " + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

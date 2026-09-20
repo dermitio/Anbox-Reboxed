@@ -1,0 +1,29 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.anbox.reboxed.signaturespoof.probe"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />
+    <uses-permission android:name="android.permission.FAKE_PACKAGE_SIGNATURE" />
+    <queries>
+        <package android:name="app.revanced.android.gms" />
+        <package android:name="com.android.vending" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:hasCode="true"
+        android:label="Reboxed Signature Spoof Probe">
+        <meta-data
+            android:name="fake-signature"
+            android:value="@string/google_signature" />
+        <activity
+            android:name=".ProbeActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

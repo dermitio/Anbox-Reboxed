@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Anbox Reboxed
+GenericName=Anbox Reboxed Android Runtime
+Comment=Start Anbox Reboxed in a phone-sized window
+Exec=anbox-reboxed-window --orientation portrait
+Icon=anbox-reboxed
+Terminal=false
+Type=Application
+Categories=System;Emulator;
+StartupNotify=true
+Keywords=Anbox Reboxed;Android;Phone;Emulator;

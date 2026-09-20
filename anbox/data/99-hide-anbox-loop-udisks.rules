@@ -1,0 +1,5 @@
+# Anbox Reboxed image loop devices are implementation details, not removable media.
+# Match the backing paths rather than filesystem labels or loop numbers: loop
+# allocation is dynamic and the Android image's label may legitimately be "/".
+SUBSYSTEM=="block", KERNEL=="loop[0-9]*", ATTR{loop/backing_file}=="/var/lib/anbox/android.img", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"
+SUBSYSTEM=="block", KERNEL=="loop[0-9]*", ATTR{loop/backing_file}=="/var/lib/anbox/vendor.img", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"

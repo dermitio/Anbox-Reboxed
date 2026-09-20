@@ -1,0 +1,15 @@
+{
+    "architecture": "armhf",
+    "description": "Anbox Reboxed - a container-based Android desktop runtime",
+    "framework": "ubuntu-sdk-15.04",
+    "hooks": {
+        "anbox": {
+            "apparmor": "apparmor.json",
+            "desktop": "anbox.desktop"
+        }
+    },
+    "maintainer": "Simon Fels <morphis@gravedo.de>",
+    "name": "org.anbox",
+    "title": "Anbox Reboxed",
+    "version": "0.0.1-devalpha"
+}

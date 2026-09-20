@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Directory
+Name=Anbox Reboxed
+GenericName=Anbox Reboxed
+Icon=${SNAP}/meta/gui/icon.png

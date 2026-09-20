@@ -1,0 +1,86 @@
+{
+  "manifest_version": 1,
+  "patch_id": "android35-gfxstream-guest-android15-release-bp1a-v8",
+  "source_tag": "android15-release",
+  "source_commits": {
+    "hardware/google/gfxstream": "619aaace4560e151a48f3d79a91611ad934ce0f6",
+    "device/generic/goldfish-opengl": "8669af429db8862a99f8def761db42fd8a1b4e0b"
+  },
+  "replacement_libraries": [
+    {
+      "target_path": "/vendor/lib64/libGLESv2_enc.so",
+      "architecture": "x86_64",
+      "android_abi": 35,
+      "original_build_id": "cad4d9b6f0ed175f224d403d48dddb9b",
+      "original_sha256": "d1bea5459dbf2506fcc50049c27c9e79a020c96bad4cdf5d118d85e7f8e7933d",
+      "replacement_file": "android-15.0.0_r26/x86_64/libGLESv2_enc.so",
+      "replacement_build_id": "2a9522ffc449228a49573995fe325976",
+      "replacement_sha256": "a82b76ef55c2a56dec24f888afbdb7aeca7bff3e62bead71c921b9df87ee1760"
+    },
+    {
+      "target_path": "/vendor/lib64/libGLESv1_enc.so",
+      "architecture": "x86_64",
+      "android_abi": 35,
+      "original_build_id": "3ccb72e54cc32d1beb792b6d6076f46e",
+      "original_sha256": "8bde5a0634cf87c9c3500c1368ae3240d9867bb6cad1917d1f13cc57c5b463be",
+      "replacement_file": "android-15.0.0_r26/x86_64/libGLESv1_enc.so",
+      "replacement_build_id": "5778d4895a5449763d9000ffa218c8c5",
+      "replacement_sha256": "d5e3b7d67597750c8a8c31ee871346b9f419f4ce71a0071ae0b1ccdae8857bc5"
+    },
+    {
+      "target_path": "/vendor/lib64/libOpenglSystemCommon.so",
+      "architecture": "x86_64",
+      "android_abi": 35,
+      "original_build_id": "eb699e20d301d300bc53e34a16755362",
+      "original_sha256": "ee178a93fe529131c208c27c1df13fe4628b7342c249b11e71ca7dce015954a4",
+      "replacement_file": "android-15.0.0_r26/x86_64/libOpenglSystemCommon.so",
+      "replacement_build_id": "eff18fa6997edf66b13f490c15636523",
+      "replacement_sha256": "fec26619c580232eb7ca8d7a1f6115ae53942a46406cdaed4590b9a312c78d12"
+    },
+    {
+      "target_path": "/vendor/lib64/lib_renderControl_enc.so",
+      "architecture": "x86_64",
+      "android_abi": 35,
+      "original_build_id": "f4719d72360ee4184cbb943f445a9496",
+      "original_sha256": "476aef26e418df4657f145c3c3e6fb8e48ca515fa559a7494770f983f9763971",
+      "replacement_file": "android-15.0.0_r26/x86_64/lib_renderControl_enc.so",
+      "replacement_build_id": "dee2ecfbe4a50590fca5f8b4d94fea59",
+      "replacement_sha256": "96c2d49c778e81e1c03d566cd885d62b1da4f7abf3f0d2860b7639ff9333d999"
+    }
+  ],
+  "target_path": "/vendor/lib64/libGLESv2_enc.so",
+  "architecture": "x86_64",
+  "android_abi": 35,
+  "build_id": "cad4d9b6f0ed175f224d403d48dddb9b",
+  "symbol": "_ZN10GL2Encoder26updateProgramInfoAfterLinkEj",
+  "symbol_value": 379904,
+  "symbol_size": 662,
+  "original_sha256": "d1bea5459dbf2506fcc50049c27c9e79a020c96bad4cdf5d118d85e7f8e7933d",
+  "patched_sha256": "2d7445f831e500fcf64a29738b93b5e2482fd1c8bc210b421c1a11c3d9180a4e",
+  "patches": [
+    {
+      "description": "require link status to equal GL_TRUE",
+      "offset": 379979,
+      "expected": "837c242c000f841c020000",
+      "replacement": "837c242c010f851c020000"
+    },
+    {
+      "description": "validate metadata before allocation and enumeration",
+      "offset": 380132,
+      "expected": "c744241800000000c744241400000000",
+      "replacement": "e9170303009090909090909090909090"
+    },
+    {
+      "description": "extend executable PT_LOAD into pre-existing zero padding",
+      "offset": 208,
+      "expected": "30090500000000003009050000000000",
+      "replacement": "59100500000000005910050000000000"
+    },
+    {
+      "description": "bounded metadata validation trampoline",
+      "offset": 577536,
+      "expected": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "replacement": "c744241800000000c744241400000000837c2428407720837c2424407719817c242000010000770f817c241c000100007705e9bdfcfcffc744242800000000c744242400000000c744242000000000c744241c00000000ebd9"
+    }
+  ]
+}

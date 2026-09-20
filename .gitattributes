@@ -1,0 +1,9 @@
+# Portable source checkouts; binary assets retain their original bytes.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

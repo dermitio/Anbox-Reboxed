@@ -1,0 +1,25 @@
+LIBC {
+    global:
+        __open_2;
+        open;
+        open64;
+        openat;
+        openat64;
+        ioctl;
+        close;
+        close_range;
+        dup;
+        dup2;
+        dup3;
+        fcntl;
+        fcntl64;
+        getxattr;
+        lgetxattr;
+        lgetfilecon;
+        getfilecon;
+        freecon;
+        uevent_create_socket;
+        uevent_bind;
+    local:
+        *;
+};

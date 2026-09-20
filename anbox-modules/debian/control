@@ -1,0 +1,23 @@
+Source: anbox-modules
+Section: kernel
+Priority: optional
+Maintainer: Simon Fels <morphis@gravedo.de>
+Uploaders:
+ Shengjing Zhu <i@zhsj.me>,
+Build-Depends:
+ debhelper (>= 9),
+ dkms,
+Standards-Version: 4.1.4
+Homepage: https://anbox.io
+Vcs-Browser: https://github.com/anbox/anbox-modules
+Vcs-Git: https://github.com/anbox/anbox-modules.git
+
+Package: anbox-modules-dkms
+Architecture: all
+Depends:
+ ${misc:Depends},
+Description: Android ashmem kernel driver in DKMS format.
+ .
+ This package contains the out-of-tree ashmem kernel driver used by
+ Anbox. Modern kernels provide binder through the in-tree binderfs
+ driver instead of this legacy DKMS package.

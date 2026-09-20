@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Create and select a quota-capable persistent Android /data image."""
+
+import argparse
+import datetime
+import json
+import os
+import pathlib
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+FORMAT_VERSION = 1
+ENABLE_MARKER = "managed-ext4-v1\n"
+REQUIRED_FEATURES = {"project", "verity"}
+MIN_FREE_MARGIN = 256 * 1024 * 1024
+MIN_IMAGE_SIZE = 8 * 1024 * 1024 * 1024
+
+
+class DataImageError(RuntimeError):
+    pass
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, check=True, text=True, **kwargs)
+
+
+def paths(data_dir):
+    root = pathlib.Path(data_dir).resolve()
+    managed = root / "state/data-image"
+    return {
+        "root": root,
+        "source": root / "data",
+        "managed": managed,
+        "image": managed / "android-data.img",
+        "pending": managed / "android-data.img.new",
+        "marker": managed / "enabled",
+        "manifest": managed / "manifest.json",
+    }
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise DataImageError("this operation must run as root")
+
+
+def require_programs(*names):
+    missing = [name for name in names if shutil.which(name) is None]
+    if missing:
+        raise DataImageError("missing required programs: " + ", ".join(missing))
+
+
+def container_state(data_dir):
+    info = shutil.which("lxc-info")
+    if not info:
+        return "UNKNOWN"
+    result = subprocess.run(
+        [info, "-P", str(data_dir / "containers"), "-n", "default", "-sH"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    return result.stdout.strip() if result.returncode == 0 else "STOPPED"
+
+
+def require_container_stopped(data_dir):
+    state = container_state(data_dir)
+    if state not in {"STOPPED", "UNKNOWN", ""}:
+        raise DataImageError(
+            "Android container must be stopped before migrating /data "
+            f"(current state: {state})")
+
+
+def allocated_bytes(path):
+    result = run(
+        ["du", "-sx", "--block-size=1", str(path)],
+        stdout=subprocess.PIPE)
+    return int(result.stdout.split()[0])
+
+
+def image_features(image):
+    result = run(["dumpe2fs", "-h", str(image)], stdout=subprocess.PIPE,
+                 stderr=subprocess.DEVNULL)
+    for line in result.stdout.splitlines():
+        if line.startswith("Filesystem features:"):
+            return set(line.split(":", 1)[1].split())
+    raise DataImageError(f"could not read ext4 features from {image}")
+
+
+def validate_image(image):
+    if not image.is_file() or image.is_symlink():
+        raise DataImageError(f"managed data image is missing or unsafe: {image}")
+    mode = image.stat().st_mode
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise DataImageError(f"managed data image is group/other-writable: {image}")
+    features = image_features(image)
+    missing = REQUIRED_FEATURES - features
+    if missing:
+        raise DataImageError(
+            "managed data image lacks required ext4 features: " +
+            ", ".join(sorted(missing)))
+    return features
+
+
+def tree_entries(root):
+    entries = set()
+    for current, directories, files in os.walk(root, followlinks=False):
+        relative = pathlib.Path(current).relative_to(root)
+        entries.update(str(relative / name) for name in directories)
+        entries.update(str(relative / name) for name in files)
+    return entries
+
+
+def verify_root_xattrs(source, destination):
+    for name in os.listxattr(source, follow_symlinks=False):
+        source_value = os.getxattr(source, name, follow_symlinks=False)
+        try:
+            destination_value = os.getxattr(
+                destination, name, follow_symlinks=False)
+        except OSError as error:
+            raise DataImageError(
+                f"root xattr was not preserved during migration: {name}") from error
+        if source_value != destination_value:
+            raise DataImageError(
+                f"root xattr changed during migration: {name}")
+
+
+def atomic_write(path, content, mode):
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def prepare(arguments):
+    require_root()
+    require_programs("cp", "du", "dumpe2fs", "e2fsck", "mkfs.ext4",
+                     "mount", "sync", "truncate", "umount")
+    value = paths(arguments.data_dir)
+    require_container_stopped(value["root"])
+    if not value["source"].is_dir() or value["source"].is_symlink():
+        raise DataImageError(
+            f"legacy Android data directory is missing or unsafe: {value['source']}")
+    if value["image"].exists() or value["marker"].exists():
+        raise DataImageError(
+            "managed data already exists; refusing to overwrite it")
+
+    used = allocated_bytes(value["source"])
+    free = shutil.disk_usage(value["root"]).free
+    if free < used + MIN_FREE_MARGIN:
+        raise DataImageError(
+            f"insufficient free space for non-destructive migration: "
+            f"need at least {used + MIN_FREE_MARGIN} bytes, have {free}")
+    requested = arguments.size_gib * 1024 * 1024 * 1024
+    image_size = max(MIN_IMAGE_SIZE, requested, used * 2 + 1024 * 1024 * 1024)
+
+    value["managed"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(value["managed"], 0o700)
+    if value["pending"].exists():
+        value["pending"].unlink()
+
+    mounted = False
+    mountpoint = None
+    try:
+        run(["truncate", "-s", str(image_size), str(value["pending"])])
+        os.chmod(value["pending"], 0o600)
+        run(["mkfs.ext4", "-q", "-F", "-L", "anbox-data", "-m", "0",
+             "-O", "project,verity,^quota", "-E",
+             "lazy_itable_init=0,lazy_journal_init=0", str(value["pending"])])
+        validate_image(value["pending"])
+
+        mountpoint = pathlib.Path(tempfile.mkdtemp(
+            prefix="anbox-data-migrate-", dir="/tmp"))
+        run(["mount", "-t", "ext4", "-o",
+             "loop,rw,nosuid,nodev,noatime",
+             str(value["pending"]), str(mountpoint)])
+        mounted = True
+        run(["cp", "-a", "--sparse=always", "--",
+             str(value["source"]) + "/.", str(mountpoint) + "/"])
+        run(["sync", "-f", str(mountpoint)])
+
+        source_entries = tree_entries(value["source"])
+        destination_entries = tree_entries(mountpoint)
+        if source_entries != destination_entries:
+            missing = sorted(source_entries - destination_entries)[:5]
+            extra = sorted(destination_entries - source_entries)[:5]
+            raise DataImageError(
+                f"migrated tree differs (missing={missing}, extra={extra})")
+        verify_root_xattrs(value["source"], mountpoint)
+
+        run(["umount", str(mountpoint)])
+        mounted = False
+        run(["e2fsck", "-fn", str(value["pending"])],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        features = validate_image(value["pending"])
+        os.replace(value["pending"], value["image"])
+
+        manifest = {
+            "format_version": FORMAT_VERSION,
+            "created_utc": datetime.datetime.now(
+                datetime.timezone.utc).isoformat(),
+            "image": value["image"].name,
+            "image_size": image_size,
+            "source_allocated_bytes": used,
+            "features": sorted(features),
+            "legacy_data_retained": True,
+        }
+        atomic_write(value["manifest"],
+                     json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                     0o600)
+    except Exception:
+        if mounted and mountpoint is not None:
+            subprocess.run(["umount", str(mountpoint)],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        if value["pending"].exists():
+            value["pending"].unlink()
+        raise
+    finally:
+        if mountpoint is not None:
+            try:
+                mountpoint.rmdir()
+            except OSError:
+                pass
+
+    print(f"prepared managed Android data image: {value['image']}")
+    print("legacy data retained; run 'enable' to select the image")
+
+
+def enable(arguments):
+    require_root()
+    value = paths(arguments.data_dir)
+    require_container_stopped(value["root"])
+    validate_image(value["image"])
+    atomic_write(value["marker"], ENABLE_MARKER, 0o600)
+    print("managed Android data image enabled for the next container-manager start")
+
+
+def disable(arguments):
+    require_root()
+    value = paths(arguments.data_dir)
+    require_container_stopped(value["root"])
+    if value["marker"].exists():
+        value["marker"].unlink()
+    print("managed Android data image disabled; legacy data will be used next start")
+
+
+def status(arguments):
+    value = paths(arguments.data_dir)
+    enabled = value["marker"].is_file()
+    print(f"enabled: {'true' if enabled else 'false'}")
+    print(f"image: {value['image']}")
+    print(f"legacy-data: {value['source']}")
+    if not value["image"].exists():
+        print("image-state: absent")
+        return
+    features = validate_image(value["image"])
+    print("image-state: valid")
+    print("required-features: " + ",".join(sorted(REQUIRED_FEATURES)))
+    print("filesystem-features: " + ",".join(sorted(features)))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    for name in ("prepare", "enable", "disable", "status"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--data-dir", default="/var/lib/anbox")
+        if name == "prepare":
+            command.add_argument("--size-gib", type=int, default=8)
+    return parser.parse_args()
+
+
+def main():
+    arguments = parse_args()
+    try:
+        {"prepare": prepare, "enable": enable, "disable": disable,
+         "status": status}[arguments.action](arguments)
+    except (DataImageError, OSError, subprocess.CalledProcessError) as error:
+        print(f"anbox-data-image: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

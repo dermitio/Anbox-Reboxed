@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+import pathlib
+import sys
+
+
+def main():
+    if len(sys.argv) != 5:
+        raise SystemExit(
+            "usage: patch-signature-spoof-smali PackageInfoUtils.smali ComputerEngine.smali PackageAbiHelperImpl.smali ScanPackageUtils.smali")
+    path = pathlib.Path(sys.argv[1])
+    source = path.read_text(encoding="utf-8")
+    needle = """    :cond_22f
+    :goto_22f
+    invoke-interface {v2}, Lcom/android/server/pm/pkg/AndroidPackage;->isStub()Z
+"""
+    replacement = """    :cond_22f
+    :goto_22f
+    move-object/from16 v3, p9
+
+    invoke-static {v2, v1, v3}, Lcom/android/server/pm/parsing/ReboxedSignatureSpoof;->apply(Lcom/android/server/pm/pkg/AndroidPackage;Landroid/content/pm/PackageInfo;Ljava/util/Set;)V
+
+    invoke-interface {v2}, Lcom/android/server/pm/pkg/AndroidPackage;->isStub()Z
+"""
+    if source.count(needle) != 1:
+        raise SystemExit("refusing to patch an unknown PackageInfoUtils signature block")
+    path.write_text(source.replace(needle, replacement), encoding="utf-8")
+
+    computer_path = pathlib.Path(sys.argv[2])
+    computer = computer_path.read_text(encoding="utf-8")
+    computer_needle = """    :goto_7b
+    if-eqz v3, :cond_94
+"""
+    computer_replacement = """    :goto_7b
+    if-nez v3, :reboxed_permission_state_ready
+
+    invoke-static {v5}, Lcom/android/server/pm/parsing/ReboxedSignatureSpoof;->needsPermissionState(Lcom/android/server/pm/pkg/AndroidPackage;)Z
+
+    move-result v3
+
+    :reboxed_permission_state_ready
+    if-eqz v3, :cond_94
+"""
+    if computer.count(computer_needle) != 1:
+        raise SystemExit("refusing to patch an unknown ComputerEngine permission block")
+    computer_path.write_text(
+        computer.replace(computer_needle, computer_replacement), encoding="utf-8")
+
+    abi_path = pathlib.Path(sys.argv[3])
+    abi = abi_path.read_text(encoding="utf-8")
+    abi_needle = """    invoke-interface/range {p1 .. p1}, Lcom/android/server/pm/pkg/AndroidPackage;->is32BitAbiPreferred()Z
+
+    move-result v2
+"""
+    abi_replacement = """    invoke-static/range {p1 .. p1}, Lcom/android/server/pm/parsing/ReboxedWebViewAbi;->is32BitAbiPreferred(Lcom/android/server/pm/pkg/AndroidPackage;)Z
+
+    move-result v2
+"""
+    if abi.count(abi_needle) != 1:
+        raise SystemExit("refusing to patch an unknown PackageAbiHelperImpl ABI block")
+    abi_path.write_text(abi.replace(abi_needle, abi_replacement), encoding="utf-8")
+
+    scan_path = pathlib.Path(sys.argv[4])
+    scan = scan_path.read_text(encoding="utf-8")
+    scan_needle = """    :cond_358
+    invoke-static {v5}, Lcom/android/server/pm/parsing/pkg/AndroidPackageUtils;->getRawPrimaryCpuAbi(Lcom/android/server/pm/pkg/AndroidPackage;)Ljava/lang/String;
+"""
+    scan_replacement = """    :cond_358
+    invoke-static {v5}, Lcom/android/server/pm/parsing/ReboxedWebViewAbi;->applyScanAbi(Lcom/android/internal/pm/parsing/pkg/ParsedPackage;)V
+
+    invoke-static {v5}, Lcom/android/server/pm/parsing/pkg/AndroidPackageUtils;->getRawPrimaryCpuAbi(Lcom/android/server/pm/pkg/AndroidPackage;)Ljava/lang/String;
+"""
+    if scan.count(scan_needle) != 1:
+        raise SystemExit("refusing to patch an unknown ScanPackageUtils ABI commit block")
+    scan_path.write_text(scan.replace(scan_needle, scan_replacement), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

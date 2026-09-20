@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility entry point retained for existing scripts and installations.
+exec "$(dirname "$0")/anbox-reboxed" "$@"

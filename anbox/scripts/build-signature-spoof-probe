@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "Usage: build-signature-spoof-probe SOURCE_DIR OUTPUT_APK SDK_ROOT" >&2
+  exit 2
+fi
+
+SOURCE_DIR="$(readlink -f -- "$1")"
+OUTPUT_APK="$2"
+SDK_ROOT="$(readlink -f -- "$3")"
+BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)"
+PLATFORM="$(find "$SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 -type d -name 'android-*' -printf '%f\n' | sort -V | tail -1)"
+TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS"
+ANDROID_JAR="$SDK_ROOT/platforms/$PLATFORM/android.jar"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/classes" "$WORK/dex" "$(dirname "$OUTPUT_APK")"
+find "$SOURCE_DIR/src" -name '*.java' -print0 | xargs -0 javac \
+  -source 8 -target 8 -bootclasspath "$ANDROID_JAR" -d "$WORK/classes"
+jar --create --file "$WORK/classes.jar" -C "$WORK/classes" .
+"$TOOLS/d8" --min-api 28 --lib "$ANDROID_JAR" \
+  --output "$WORK/dex" "$WORK/classes.jar"
+"$TOOLS/aapt" package -f -M "$SOURCE_DIR/AndroidManifest.xml" \
+  -S "$SOURCE_DIR/res" -I "$ANDROID_JAR" -F "$WORK/unsigned.apk"
+cp "$WORK/unsigned.apk" "$WORK/package.apk"
+zip -q -9 -j "$WORK/package.apk" "$WORK/dex/classes.dex"
+
+KEYSTORE="$(dirname "$OUTPUT_APK")/signature-spoof-probe.p12"
+if [[ ! -f "$KEYSTORE" ]]; then
+  keytool -genkeypair -noprompt -storetype PKCS12 -keystore "$KEYSTORE" \
+    -storepass android -keypass android -alias reboxed-signature-probe \
+    -keyalg RSA -keysize 2048 -validity 36500 \
+    -dname 'CN=Anbox Reboxed Signature Probe,O=Local Build,C=XX' >/dev/null
+fi
+TEMP_OUTPUT="${OUTPUT_APK}.tmp"
+"$TOOLS/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android \
+  --ks-key-alias reboxed-signature-probe --out "$TEMP_OUTPUT" \
+  "$WORK/package.apk"
+"$TOOLS/apksigner" verify "$TEMP_OUTPUT"
+mv -f "$TEMP_OUTPUT" "$OUTPUT_APK"

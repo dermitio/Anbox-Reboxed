@@ -1,0 +1,2 @@
+SUBSYSTEM=="misc", KERNEL=="ashmem", MODE="0666"
+SUBSYSTEM=="binder", KERNEL=="binder*", MODE="0666"

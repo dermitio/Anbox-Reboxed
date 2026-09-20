@@ -1,0 +1,1902 @@
+#!/usr/bin/env python3
+"""Transactional Android Native Bridge backend management.
+
+The public devalpha release includes no ARM translator. Backend management
+is retained for diagnostics, disabling existing installations, and explicitly
+supplied external backends; Berberis support is for unpublished local images.
+This tool contains no translator and never modifies the original image.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import pwd
+import re
+import shlex
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import zipfile
+
+SCHEMA = 2
+LEGACY_SCHEMA = 1
+MAX_SOURCE = 4 * 1024 * 1024 * 1024
+MAX_FILE = 512 * 1024 * 1024
+MAX_FILES = 4096
+OVERLAY_NAME = "native-bridge"
+TRANSLATOR_NAMES = {"libndk_translation.so", "libhoudini.so"}
+OFFICIAL_BACKEND_ID = "berberis"
+OFFICIAL_TRANSLATOR = "libberberis_arm64.so"
+OFFICIAL_MANIFEST = "/system/etc/anbox/native-bridge/berberis.json"
+OFFICIAL_INTERFACE_VERSION = 7
+OFFICIAL_REQUIRED_PATHS = {
+    "/system/lib64/libberberis_arm64.so": 0o644,
+    "/system/bin/arm64/app_process64": 0o755,
+    "/system/bin/arm64/linker64": 0o755,
+    "/system/lib64/arm64/libnative_bridge_vdso.so": 0o644,
+    "/system/lib64/arm64/libc.so": 0o644,
+    "/system/lib64/arm64/libdl.so": 0o644,
+    "/system/lib64/arm64/libm.so": 0o644,
+    "/system/lib64/arm64/libc++.so": 0o644,
+    "/system/lib64/arm64/liblog.so": 0o644,
+    "/system/lib64/arm64/libandroid.so": 0o644,
+    "/system/lib64/arm64/libz.so": 0o644,
+    "/system/lib64/arm64/libEGL.so": 0o644,
+    "/system/lib64/arm64/ld-android.so": 0o755,
+    "/system/lib64/arm64/linux-vdso.so.1": 0o644,
+}
+SAFE_SYSTEM_LIBS = {
+    "libandroid.so", "libc.so", "libdl.so", "liblog.so", "libm.so", "libstdc++.so",
+    "libc++.so", "libz.so", "libbase.so", "libutils.so",
+}
+PROPERTY_KEYS = {
+    "ro.dalvik.vm.native.bridge",
+    "ro.enable.native.bridge.exec",
+    "ro.dalvik.vm.isa.arm",
+    "ro.dalvik.vm.isa.arm64",
+    "ro.product.cpu.abilist",
+    "ro.product.cpu.abilist32",
+    "ro.product.cpu.abilist64",
+}
+PROPERTY_RELATIVES = ("system/etc/prop.default", "system/build.prop", "default.prop")
+PARTITIONS = ("system", "system_ext", "product", "vendor")
+KNOWN_INTERNAL_LINKS = {
+    pathlib.PurePosixPath("system/lib64/libnb.so"):
+        "libndk_translation.so",
+    pathlib.PurePosixPath("system/lib/libnb.so"):
+        "../lib64/libndk_translation.so",
+}
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def safe_member(name):
+    normalized = pathlib.PurePosixPath(name.replace("\\", "/"))
+    if normalized.is_absolute() or ".." in normalized.parts:
+        raise BridgeError("archive contains an unsafe path: " + name)
+    parts = tuple(part for part in normalized.parts if part not in ("", "."))
+    if not parts:
+        return None
+    return pathlib.Path(*parts)
+
+
+def safe_link_target(member, target):
+    if os.path.isabs(target):
+        raise BridgeError("archive contains an absolute symlink: " + str(member))
+    parts = []
+    for part in (pathlib.PurePosixPath(member).parent / target).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise BridgeError("archive symlink escapes payload: " + str(member))
+            parts.pop()
+        else:
+            parts.append(part)
+    if not parts:
+        raise BridgeError("archive symlink has an empty target: " + str(member))
+    return target
+
+
+def write_member(stream, destination, size):
+    if size < 0 or size > MAX_FILE:
+        raise BridgeError("archive member exceeds the 512 MiB limit")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(destination, "xb") as output:
+        remaining = size
+        while remaining:
+            block = stream.read(min(1024 * 1024, remaining))
+            if not block:
+                raise BridgeError("archive member ended unexpectedly")
+            output.write(block)
+            remaining -= len(block)
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(destination, 0o644)
+
+
+def extract_archive(source, destination):
+    count = 0
+    total = 0
+    links = []
+    if zipfile.is_zipfile(source):
+        with zipfile.ZipFile(source) as archive:
+            for item in archive.infolist():
+                count += 1
+                if count > MAX_FILES:
+                    raise BridgeError("archive contains too many entries")
+                relative = safe_member(item.filename)
+                if relative is None:
+                    continue
+                unix_mode = item.external_attr >> 16
+                if stat.S_ISLNK(unix_mode):
+                    with archive.open(item) as stream:
+                        target = stream.read(MAX_FILE + 1).decode("utf-8")
+                    safe_link_target(relative, target)
+                    links.append((destination / relative, target))
+                    continue
+                if item.is_dir():
+                    (destination / relative).mkdir(mode=0o700, parents=True,
+                                                   exist_ok=True)
+                    continue
+                total += item.file_size
+                if total > MAX_SOURCE:
+                    raise BridgeError("expanded archive exceeds 4 GiB")
+                with archive.open(item) as stream:
+                    write_member(stream, destination / relative, item.file_size)
+        for path, target in links:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.symlink(target, path)
+        repair_known_internal_links(destination)
+        validate_tree(destination)
+        return
+    if tarfile.is_tarfile(source):
+        with tarfile.open(source, "r:*") as archive:
+            for item in archive:
+                count += 1
+                if count > MAX_FILES:
+                    raise BridgeError("archive contains too many entries")
+                relative = safe_member(item.name)
+                if relative is None:
+                    continue
+                if item.issym():
+                    target = safe_link_target(relative, item.linkname)
+                    links.append((destination / relative, target))
+                    continue
+                if item.islnk():
+                    raise BridgeError("archive hard links are not accepted: " + item.name)
+                if item.isdir():
+                    (destination / relative).mkdir(mode=0o700, parents=True,
+                                                   exist_ok=True)
+                    continue
+                if not item.isfile():
+                    raise BridgeError("archive contains a special file: " + item.name)
+                total += item.size
+                if total > MAX_SOURCE:
+                    raise BridgeError("expanded archive exceeds 4 GiB")
+                stream = archive.extractfile(item)
+                if stream is None:
+                    raise BridgeError("cannot read archive member: " + item.name)
+                with stream:
+                    write_member(stream, destination / relative, item.size)
+        for path, target in links:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.symlink(target, path)
+        repair_known_internal_links(destination)
+        validate_tree(destination)
+        return
+    raise BridgeError("source is not a supported zip or tar archive")
+
+
+def payload_relative(root, path):
+    return pathlib.PurePosixPath(path.relative_to(root).as_posix())
+
+
+def repair_known_internal_links(root):
+    """Repair only the two aliases used by Google's libndk packaging.
+
+    The source is copied before this runs, so user-owned input is never
+    modified.  A repair is accepted only when the canonical translator target
+    exists and the replacement remains under the extracted payload root.
+    """
+    root = pathlib.Path(root).resolve()
+    repaired = []
+    for relative, target in KNOWN_INTERNAL_LINKS.items():
+        path = root / pathlib.Path(*relative.parts)
+        if not path.is_symlink():
+            continue
+        try:
+            path.resolve(strict=True).relative_to(root)
+            continue
+        except (OSError, ValueError):
+            pass
+        intended = path.parent / target
+        try:
+            intended.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError):
+            raise BridgeError("known payload alias has no unambiguous internal target: " +
+                              str(path))
+        if not intended.resolve(strict=True).is_file():
+            raise BridgeError("known payload alias target is not a file: " + str(path))
+        path.unlink()
+        os.symlink(target, path)
+        repaired.append({"path": relative.as_posix(), "target": target})
+    return repaired
+
+
+def validate_tree(root, allow_known_broken=False):
+    root = pathlib.Path(root).resolve()
+    count = 0
+    total = 0
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = pathlib.Path(directory) / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(path)
+                if os.path.isabs(target):
+                    raise BridgeError("payload has an absolute symlink: " + str(path))
+                try:
+                    path.parent.joinpath(target).resolve(strict=True).relative_to(root)
+                except (OSError, ValueError):
+                    relative = payload_relative(root, path)
+                    if allow_known_broken and relative in KNOWN_INTERNAL_LINKS:
+                        expected = path.parent / KNOWN_INTERNAL_LINKS[relative]
+                        try:
+                            expected.resolve(strict=True).relative_to(root)
+                            continue
+                        except (OSError, ValueError):
+                            pass
+                    raise BridgeError("payload symlink escapes, is broken, or loops: " + str(path))
+                count += 1
+                continue
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise BridgeError("payload contains a special file: " + str(path))
+            count += 1
+            if count > MAX_FILES:
+                raise BridgeError("payload contains too many files")
+            if stat.S_ISREG(info.st_mode):
+                if info.st_size > MAX_FILE:
+                    raise BridgeError("payload file exceeds 512 MiB: " + str(path))
+                total += info.st_size
+                if total > MAX_SOURCE:
+                    raise BridgeError("payload exceeds 4 GiB")
+
+
+def copy_source(source, destination):
+    source = pathlib.Path(source)
+    if not source.exists():
+        raise BridgeError("source does not exist: " + str(source))
+    if source.is_symlink():
+        raise BridgeError("source may not be a symlink")
+    if source.is_dir():
+        validate_tree(source, allow_known_broken=True)
+        shutil.copytree(source, destination, symlinks=True)
+        repair_known_internal_links(destination)
+        validate_tree(destination)
+        return
+    if source.stat().st_size > MAX_SOURCE:
+        raise BridgeError("source exceeds 4 GiB")
+    destination.mkdir(mode=0o700)
+    suffix = source.suffix.lower()
+    if zipfile.is_zipfile(source) or tarfile.is_tarfile(source):
+        extract_archive(source, destination)
+    elif suffix in (".img", ".ext2", ".ext3", ".ext4"):
+        result = subprocess.run(
+            ["debugfs", "-R", "rdump / " + str(destination), str(source)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode:
+            raise BridgeError("failed to extract ext image: " + result.stderr.strip())
+        repair_known_internal_links(destination)
+        validate_tree(destination)
+    else:
+        shutil.copyfile(source, destination / source.name)
+        os.chmod(destination / source.name, 0o644)
+
+
+def elf_info(path):
+    with open(path, "rb") as stream:
+        header = stream.read(64)
+    if len(header) < 52 or header[:4] != b"\x7fELF" or header[5] != 1:
+        raise BridgeError(str(path) + ": not a little-endian ELF file")
+    bits = 64 if header[4] == 2 else 32 if header[4] == 1 else 0
+    machine = struct.unpack_from("<H", header, 18)[0]
+    names = {3: "x86", 40: "arm", 62: "x86_64", 183: "arm64"}
+    if not bits or machine not in names:
+        raise BridgeError(str(path) + ": unsupported ELF architecture")
+    return bits, names[machine]
+
+
+def needed_libraries(path):
+    result = subprocess.run(["readelf", "-d", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    if result.returncode:
+        raise BridgeError("readelf failed for " + str(path))
+    return re.findall(r"\(NEEDED\).*?\[([^]]+)\]", result.stdout)
+
+
+def translator_target(path, bits):
+    parts = path.parts
+    indexes = [parts.index(name) for name in PARTITIONS if name in parts]
+    if indexes:
+        relative = pathlib.Path(*parts[min(indexes):])
+    else:
+        relative = pathlib.Path("system", "lib64" if bits == 64 else "lib",
+                                path.name)
+    if ".." in relative.parts or relative.is_absolute():
+        raise BridgeError("unsafe translator target")
+    return relative
+
+
+def elf_metadata(path):
+    bits, machine = elf_info(path)
+    dynamic = subprocess.run(["readelf", "-dW", str(path)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+    program = subprocess.run(["readelf", "-lW", str(path)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+    versions = subprocess.run(["readelf", "--version-info", str(path)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    soname = re.search(r"\(SONAME\).*?\[([^]]+)\]", dynamic.stdout)
+    interpreter = re.search(r"Requesting program interpreter:\s*([^]]+)\]",
+                            program.stdout)
+    return {
+        "bits": bits,
+        "machine": machine,
+        "soname": soname.group(1) if soname else None,
+        "interpreter": interpreter.group(1) if interpreter else None,
+        "needed": re.findall(r"\(NEEDED\).*?\[([^]]+)\]", dynamic.stdout),
+        "symbol_versions": sorted(set(re.findall(
+            r"Name:\s+([^\s]+)", versions.stdout))),
+    }
+
+
+def native_bridge_interface_version(path):
+    symbols = subprocess.run(["readelf", "-sW", str(path)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+    match = re.search(r"\b([0-9a-fA-F]+)\s+\d+\s+OBJECT\s+GLOBAL\s+DEFAULT\s+\d+\s+NativeBridgeItf\b",
+                      symbols.stdout)
+    if not match:
+        return None
+    address = int(match.group(1), 16)
+    segments = subprocess.run(["readelf", "-lW", str(path)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    for line in segments.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or fields[0] != "LOAD":
+            continue
+        offset, virtual, file_size = (int(fields[index], 16)
+                                      for index in (1, 2, 4))
+        if virtual <= address < virtual + file_size:
+            with open(path, "rb") as stream:
+                stream.seek(offset + address - virtual)
+                value = stream.read(4)
+            return struct.unpack("<I", value)[0] if len(value) == 4 else None
+    return None
+
+
+def libndk_arm64_file(target):
+    value = target.as_posix()
+    name = target.name
+    if ("/arm/" in value or name.endswith(".arm.txt") or
+            re.search(r"binfmt_misc_arm(?:$|\.)", name)):
+        return False
+    return ("/arm64/" in value or name.endswith(".arm64.txt") or
+            name.startswith("libndk_translation") or
+            name.startswith("ndk_translation") or
+            (name == "libnb.so" and "lib64" in target.parts) or
+            name == "binfmt_misc_arm64")
+
+
+def build_payload(extracted, output):
+    candidates = []
+    all_libraries = {}
+    extracted = pathlib.Path(extracted).resolve()
+    paths = sorted(extracted.rglob("*"),
+                   key=lambda item: (item.is_symlink(), item.as_posix()))
+    for path in paths:
+        if not path.is_file():
+            continue
+        if path.name.endswith(".so"):
+            try:
+                bits, architecture = elf_info(path)
+            except BridgeError:
+                continue
+            all_libraries.setdefault((bits, architecture, path.name), path)
+            if path.name in TRANSLATOR_NAMES:
+                candidates.append((path, bits, architecture))
+    if not candidates:
+        raise BridgeError("no supported Native Bridge translator library was found")
+
+    architectures = set()
+    translator_name = None
+    translators = []
+    identities = set()
+    for source, bits, architecture in candidates:
+        identity = (sha256(source.resolve()), bits, architecture)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        if source.resolve().stat().st_mode & 0o022:
+            raise BridgeError("translator source is group/world writable: " +
+                              str(source))
+        if architecture not in ("x86", "x86_64"):
+            raise BridgeError("translator must execute on the x86/x86_64 guest: " +
+                              str(source))
+        if translator_name and source.name != translator_name:
+            raise BridgeError("payload mixes different translator implementations")
+        translator_name = source.name
+        architectures.add("arm64-v8a" if bits == 64 else "armeabi-v7a")
+        translators.append((source, bits, architecture))
+        for dependency in needed_libraries(source):
+            if dependency in SAFE_SYSTEM_LIBS:
+                continue
+            bundled = all_libraries.get((bits, architecture, dependency))
+            if bundled is None:
+                raise BridgeError("missing translator dependency %s (%d-bit %s)" %
+                                  (dependency, bits, architecture))
+
+    selected = []
+    if translator_name == "libndk_translation.so":
+        # Google's payload relies on its arm64 guest linker/runtime directory,
+        # proxy libraries, cpuinfo/linker metadata and runner. Preserve their
+        # original partition-relative locations, but deliberately omit every
+        # ARM32 component when no genuine ELF32 host translator exists.
+        arm64_only = architectures == {"arm64-v8a"}
+        for item in paths:
+            if not item.is_file():
+                continue
+            try:
+                item_bits, _ = elf_info(item)
+            except BridgeError:
+                item_bits = 64
+            target = translator_target(item, item_bits)
+            if arm64_only and not libndk_arm64_file(target):
+                continue
+            if libndk_arm64_file(target):
+                selected.append((item, item_bits, target))
+    else:
+        for source, bits, architecture in translators:
+            selected.append((source, bits, translator_target(source, bits)))
+            for dependency in needed_libraries(source):
+                if dependency in SAFE_SYSTEM_LIBS:
+                    continue
+                bundled = all_libraries[(bits, architecture, dependency)]
+                selected.append((bundled, bits, translator_target(bundled, bits)))
+
+    files = []
+    staged_identities = {}
+    deduplicated = []
+    for item, item_bits, target in selected:
+        resolved = item.resolve(strict=True)
+        identity = (sha256(resolved),) + elf_info(resolved) if resolved.name.endswith(".so") else None
+        if item.is_symlink() and identity in staged_identities:
+            deduplicated.append({"path": "/" + target.as_posix(),
+                                 "same_as": staged_identities[identity]})
+            continue
+        destination = output / target
+        if destination.exists():
+            continue
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        shutil.copyfile(resolved, destination)
+        mode = 0o755 if "bin" in target.parts else 0o644
+        os.chmod(destination, mode)
+        entry = {"path": "/" + target.as_posix(),
+                 "sha256": sha256(destination),
+                 "size": destination.stat().st_size,
+                 "mode": mode,
+                 "bits": item_bits}
+        try:
+            entry["elf"] = elf_metadata(destination)
+        except BridgeError:
+            pass
+        files.append(entry)
+        if identity:
+            staged_identities.setdefault(identity, entry["path"])
+    interface_versions = sorted(set(filter(lambda value: value is not None,
+        (native_bridge_interface_version(source) for source, _, _ in translators))))
+    return (translator_name, sorted(architectures),
+            sorted(files, key=lambda item: item["path"]), deduplicated,
+            interface_versions)
+
+
+def state_paths(args):
+    root = pathlib.Path(args.data_dir) / "state" / OVERLAY_NAME
+    return root, root / "payload", root / "manifest.json"
+
+
+def official_relative_path(value):
+    if not isinstance(value, str):
+        raise BridgeError("official backend has an invalid artifact path")
+    path = pathlib.PurePosixPath(value)
+    if (not path.is_absolute() or ".." in path.parts or len(path.parts) < 3 or
+            path.parts[1] != "system"):
+        raise BridgeError("official backend has an unsafe artifact path: " + str(value))
+    return pathlib.Path(*path.parts[1:])
+
+
+def extract_system_file(args, value, destination):
+    relative = official_relative_path(value)
+    combined = pathlib.Path(args.data_dir) / "combined-rootfs"
+    candidate = combined / relative
+    if candidate.is_file():
+        if candidate.is_symlink():
+            raise BridgeError("official backend artifact must not be a symlink: " + value)
+        return candidate
+
+    image = pathlib.Path(args.android_image)
+    if not image.is_file() or image.is_symlink():
+        raise BridgeError("official backend artifact is unavailable: " + value)
+    if shutil.which("debugfs") is None:
+        raise BridgeError("debugfs is required to inspect the official backend")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+    result = subprocess.run(
+        ["debugfs", "-R", "dump %s %s" %
+         (debugfs_word(value), debugfs_word(destination)), str(image)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode or not destination.is_file():
+        raise BridgeError("official backend artifact is missing from the Android image: " + value)
+    return destination
+
+
+def load_official_descriptor(args):
+    with tempfile.TemporaryDirectory(prefix="anbox-berberis-manifest-") as raw:
+        source = extract_system_file(args, OFFICIAL_MANIFEST,
+                                     pathlib.Path(raw) / "berberis.json")
+        try:
+            descriptor = json.loads(source.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BridgeError("official Berberis manifest is invalid") from error
+    if descriptor.get("schema") != 1:
+        raise BridgeError("unsupported official Berberis manifest schema")
+    expected = {
+        "backend_id": OFFICIAL_BACKEND_ID,
+        "backend_kind": "builtin-image",
+        "translator": OFFICIAL_TRANSLATOR,
+        "host_arch": "x86_64",
+        "guest_arch": "arm64",
+    }
+    for key, value in expected.items():
+        if descriptor.get(key) != value:
+            raise BridgeError("official Berberis manifest has invalid %s" % key)
+    if descriptor.get("detected_abis") != ["arm64-v8a"]:
+        raise BridgeError("official Berberis manifest has an invalid ABI set")
+    if descriptor.get("native_bridge_interface_versions") != [OFFICIAL_INTERFACE_VERSION]:
+        raise BridgeError("official Berberis manifest has an invalid interface version")
+    version = descriptor.get("backend_version")
+    revision = descriptor.get("source_revision")
+    if not isinstance(version, str) or not version or not isinstance(revision, str) or not revision:
+        raise BridgeError("official Berberis manifest lacks version provenance")
+    return descriptor
+
+
+def validate_official_files(args, manifest):
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files or len(files) > MAX_FILES:
+        raise BridgeError("official Berberis manifest has an invalid artifact inventory")
+    entries = {}
+    for item in files:
+        if not isinstance(item, dict):
+            raise BridgeError("official Berberis manifest has an invalid artifact entry")
+        value = item.get("path")
+        official_relative_path(value)
+        if value in entries:
+            raise BridgeError("official Berberis manifest repeats an artifact: " + value)
+        digest = item.get("sha256")
+        mode = item.get("mode")
+        if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or
+                not isinstance(mode, int)):
+            raise BridgeError("official Berberis manifest has invalid metadata: " + value)
+        entries[value] = item
+    missing = sorted(set(OFFICIAL_REQUIRED_PATHS) - set(entries))
+    if missing:
+        raise BridgeError("official Berberis image is incomplete: " + ",".join(missing))
+    for value, expected_mode in OFFICIAL_REQUIRED_PATHS.items():
+        if entries[value]["mode"] != expected_mode:
+            raise BridgeError("official Berberis manifest has an invalid mode: " + value)
+
+    with tempfile.TemporaryDirectory(prefix="anbox-berberis-verify-") as raw:
+        scratch = pathlib.Path(raw)
+        for index, item in enumerate(files):
+            source = extract_system_file(args, item["path"], scratch / str(index))
+            if sha256(source) != item["sha256"]:
+                raise BridgeError("official Berberis artifact checksum failed: " + item["path"])
+            combined = pathlib.Path(args.data_dir) / "combined-rootfs" / \
+                official_relative_path(item["path"])
+            if combined.is_file() and stat.S_IMODE(combined.stat().st_mode) != item["mode"]:
+                raise BridgeError("official Berberis artifact mode failed: " + item["path"])
+
+        translator = extract_system_file(
+            args, "/system/lib64/libberberis_arm64.so", scratch / "translator")
+        bits, architecture = elf_info(translator)
+        if bits != 64 or architecture != "x86_64":
+            raise BridgeError("official Berberis translator is not an x86_64 ELF library")
+        if native_bridge_interface_version(translator) != OFFICIAL_INTERFACE_VERSION:
+            raise BridgeError("official Berberis translator does not export interface version 7")
+    return True
+
+
+def enabled_marker(args):
+    root, _, _ = state_paths(args)
+    return root / "enabled"
+
+
+def managed_image(args):
+    root, _, _ = state_paths(args)
+    return root / "managed-system.img"
+
+
+def debugfs_word(value):
+    # debugfs' command parser accepts shell-style single-quoted words.
+    return shlex.quote(str(value))
+
+
+def build_managed_image(args, manifest):
+    image = pathlib.Path(args.android_image)
+    if not image.is_file() or image.is_symlink():
+        raise BridgeError("configured Android image is unavailable or unsafe: " + str(image))
+    if shutil.which("debugfs") is None or shutil.which("e2fsck") is None:
+        raise BridgeError("debugfs and e2fsck are required to build the managed Android image")
+    root, payload, _ = state_paths(args)
+    destination = managed_image(args)
+    temporary = root / ("managed-system.img.new-%d" % os.getpid())
+    commands = root / ("managed-system.debugfs-%d" % os.getpid())
+    verify_file = root / ("managed-system.verify-%d" % os.getpid())
+    temporary.unlink(missing_ok=True)
+    commands.unlink(missing_ok=True)
+    verify_file.unlink(missing_ok=True)
+    try:
+        copy = subprocess.run(
+            ["cp", "--reflink=auto", "--sparse=always", "--preserve=mode,timestamps",
+             str(image), str(temporary)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        if copy.returncode:
+            raise BridgeError("failed to clone Android image: " + command_output(copy))
+        os.chmod(temporary, 0o644)
+        directories = set()
+        for item in manifest["files"]:
+            path = pathlib.PurePosixPath(item["path"])
+            parent = path.parent
+            while str(parent) not in ("/", "."):
+                directories.add(str(parent))
+                parent = parent.parent
+        with open(commands, "w", encoding="utf-8") as stream:
+            for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
+                stream.write("mkdir %s\n" % debugfs_word(directory))
+                stream.write("set_inode_field %s mode 040755\n" % debugfs_word(directory))
+                stream.write("set_inode_field %s uid 0\n" % debugfs_word(directory))
+                stream.write("set_inode_field %s gid 0\n" % debugfs_word(directory))
+            for item in manifest["files"]:
+                target = item["path"]
+                source = payload / target.lstrip("/")
+                stream.write("rm %s\n" % debugfs_word(target))
+                stream.write("write %s %s\n" % (debugfs_word(source), debugfs_word(target)))
+                stream.write("set_inode_field %s mode 010%04o\n" %
+                             (debugfs_word(target), item.get("mode", 0o644)))
+                stream.write("set_inode_field %s uid 0\n" % debugfs_word(target))
+                stream.write("set_inode_field %s gid 0\n" % debugfs_word(target))
+        result = subprocess.run(["debugfs", "-w", "-f", str(commands), str(temporary)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode:
+            raise BridgeError("failed to inject Native Bridge into managed image: " +
+                              command_output(result))
+        check = subprocess.run(["e2fsck", "-fn", str(temporary)],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if check.returncode not in (0, 1):
+            raise BridgeError("managed Android image filesystem check failed: " +
+                              check.stdout[-2048:].strip())
+        for item in manifest["files"]:
+            verify_file.unlink(missing_ok=True)
+            result = subprocess.run(
+                ["debugfs", "-R", "dump %s %s" %
+                 (debugfs_word(item["path"]), debugfs_word(verify_file)), str(temporary)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if (result.returncode or not verify_file.is_file() or
+                    sha256(verify_file) != item["sha256"]):
+                raise BridgeError("managed Android image verification failed: " + item["path"])
+        os.replace(temporary, destination)
+        fsync_directory(root)
+    finally:
+        temporary.unlink(missing_ok=True)
+        commands.unlink(missing_ok=True)
+        verify_file.unlink(missing_ok=True)
+    return destination
+
+
+def bindtab_path(args):
+    return pathlib.Path(args.data_dir) / "bindtab"
+
+
+def atomic_bindtab(args, lines):
+    path = bindtab_path(args)
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".native-bridge.tmp")
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write("".join(line.rstrip("\n") + "\n" for line in lines))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    fsync_directory(path.parent)
+
+
+def current_bindtab(args):
+    path = bindtab_path(args)
+    if not path.is_file():
+        return []
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def without_bridge_bindings(lines):
+    return [line for line in lines if "/state/native-bridge/" not in line]
+
+
+def load_manifest(args):
+    _, _, path = state_paths(args)
+    if not path.is_file():
+        raise BridgeError("no Native Bridge payload is installed")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schema") == LEGACY_SCHEMA:
+        data["schema"] = SCHEMA
+        data.setdefault("backend_id", "external")
+        data.setdefault("backend_kind", "external-payload")
+        data.setdefault("backend_version", "legacy")
+        data.setdefault("host_arch", "x86_64")
+        data.setdefault("guest_arch", "arm64" if "arm64-v8a" in
+                        data.get("detected_abis", []) else "arm")
+    elif data.get("schema") != SCHEMA:
+        raise BridgeError("unsupported Native Bridge manifest schema")
+    if data.get("backend_kind") not in ("builtin-image", "external-payload"):
+        raise BridgeError("unsupported Native Bridge backend kind")
+    return data
+
+
+def property_source(args):
+    # Reboxed may already provide a compatibility build.prop at the same LXC
+    # target as the image's file (for example synthesized vendor patch-level
+    # properties required by KeyMint). Native Bridge must layer on that source,
+    # not shadow it with the less complete stock image file.
+    reboxed = pathlib.Path(args.data_dir) / "state" / "anbox.prop"
+    if reboxed.is_file() and not reboxed.is_symlink():
+        return (reboxed.read_text(encoding="utf-8"),
+                pathlib.Path("system/build.prop"), str(reboxed))
+    combined = pathlib.Path(args.data_dir) / "combined-rootfs"
+    searched = []
+    for relative in PROPERTY_RELATIVES:
+        candidate = combined / relative
+        searched.append(str(candidate))
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8"), pathlib.Path(relative), str(candidate)
+    image = pathlib.Path(args.android_image)
+    for relative in PROPERTY_RELATIVES:
+        searched.append(str(image) + ":/" + relative)
+        if not image.is_file():
+            continue
+        with tempfile.NamedTemporaryFile(prefix="anbox-native-prop-", delete=False) as stream:
+            temporary = pathlib.Path(stream.name)
+        try:
+            result = subprocess.run(["debugfs", "-R", "dump /%s %s" %
+                                     (relative, temporary), str(image)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True)
+            if result.returncode == 0 and temporary.is_file() and temporary.stat().st_size:
+                return temporary.read_text(encoding="utf-8"), pathlib.Path(relative), \
+                    str(image) + ":/" + relative
+        finally:
+            temporary.unlink(missing_ok=True)
+    raise BridgeError("Android property source is unavailable; searched: " + "; ".join(searched))
+
+
+def parse_properties(text):
+    result = {}
+    for line in text.splitlines():
+        if line and not line.lstrip().startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            result[key.strip()] = value.strip()
+    return result
+
+
+def merged_property_text(original, updates):
+    output = []
+    seen = set()
+    for line in original.splitlines():
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0] if "=" in stripped else ""
+        if key in PROPERTY_KEYS:
+            if key in updates and key not in seen:
+                output.append(key + "=" + updates[key])
+                seen.add(key)
+            continue
+        output.append(line)
+    output.append("# Properties added by Anbox Reboxed Native Bridge")
+    for key in sorted(updates):
+        if key not in seen:
+            output.append(key + "=" + updates[key])
+    return "\n".join(output) + "\n"
+
+
+def property_updates(manifest, verified, temporary_abis=None):
+    updates = {
+        "ro.dalvik.vm.native.bridge": manifest["translator"],
+    }
+    working = list(temporary_abis) if temporary_abis is not None else [
+        abi for abi in ("arm64-v8a", "armeabi-v7a")
+        if verified.get(abi, {}).get("passed")]
+    if "armeabi-v7a" in working:
+        updates["ro.dalvik.vm.isa.arm"] = "x86"
+    if "arm64-v8a" in working:
+        updates["ro.dalvik.vm.isa.arm64"] = "x86_64"
+    # Detection only stages the translator. ABIs become visible to PackageManager
+    # after an actual guest execution has passed for that architecture.
+    if working:
+        source_props = manifest.get("original_properties", {})
+        native64 = [abi for abi in source_props.get("ro.product.cpu.abilist64", "x86_64").split(",") if abi]
+        native32 = [abi for abi in source_props.get("ro.product.cpu.abilist32", "x86").split(",") if abi]
+        if "arm64-v8a" in working and "arm64-v8a" not in native64:
+            native64.append("arm64-v8a")
+        if "armeabi-v7a" in working and "armeabi-v7a" not in native32:
+            native32.extend(abi for abi in ("armeabi-v7a", "armeabi")
+                            if abi not in native32)
+        updates["ro.product.cpu.abilist64"] = ",".join(native64)
+        updates["ro.product.cpu.abilist32"] = ",".join(native32)
+        updates["ro.product.cpu.abilist"] = ",".join(native64 + native32)
+    return updates
+
+
+def write_property_overlay(args, manifest, temporary_abis=None):
+    root, _, _ = state_paths(args)
+    original, relative, source = property_source(args)
+    verified = manifest.get("verification", {})
+    output = root / "properties" / relative
+    output.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(merged_property_text(original,
+                                          property_updates(manifest, verified,
+                                                           temporary_abis)))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, output)
+    return output, source
+
+
+def expected_persistent_properties(manifest):
+    """Return the immutable Android properties expected after verification."""
+    updates = property_updates(manifest, manifest.get("verification", {}))
+    return {key: updates[key] for key in (
+        "ro.product.cpu.abilist",
+        "ro.product.cpu.abilist32",
+        "ro.product.cpu.abilist64",
+        "ro.dalvik.vm.native.bridge",
+    ) if key in updates}
+
+
+def validate_persistent_properties(args, manifest):
+    """Prove that init, rather than only manager state, consumed the overlay."""
+    expected = expected_persistent_properties(manifest)
+    mismatches = []
+    for key, wanted in expected.items():
+        result = android_command(args, ["/system/bin/getprop", key])
+        actual = result.stdout.strip() if result.returncode == 0 else "<unavailable>"
+        if actual != wanted:
+            mismatches.append("%s=%s (expected %s)" % (key, actual or "<empty>", wanted))
+    if mismatches:
+        raise BridgeError("persistent Native Bridge property activation failed: " +
+                          "; ".join(mismatches))
+
+
+def activate_persistent_properties(args, manifest):
+    # write_property_overlay uses atomic replacement. An already active bind
+    # mount continues to reference the old inode, and Android ro.* properties
+    # cannot be updated after init. A restart is therefore part of committing
+    # verified ABI support, not an optional follow-up action.
+    write_property_overlay(args, manifest)
+    restart_guest(args)
+    validate_persistent_properties(args, manifest)
+
+
+def live_native_bridge_properties(args):
+    values = {}
+    for key in ("ro.product.cpu.abilist", "ro.product.cpu.abilist32",
+                "ro.product.cpu.abilist64",
+                "ro.dalvik.vm.native.bridge"):
+        try:
+            result = android_command(args, ["/system/bin/getprop", key])
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        values[key] = result.stdout.strip()
+    return values
+
+
+def effective_advertised_abis(manifest, configured, live_properties):
+    if not manifest.get("enabled") or not configured or live_properties is None:
+        return []
+    if live_properties.get("ro.dalvik.vm.native.bridge") != manifest.get("translator"):
+        return []
+    live = live_properties.get("ro.product.cpu.abilist", "").split(",")
+    return [abi for abi, result in manifest.get("verification", {}).items()
+            if result.get("passed") and abi in live]
+
+
+def live_state_matches_configuration(manifest, configured, live_properties):
+    if live_properties is None:
+        return False
+    if manifest.get("enabled") and configured:
+        expected = expected_persistent_properties(manifest)
+        return all(live_properties.get(key) == value for key, value in expected.items())
+    live_abis = live_properties.get("ro.product.cpu.abilist", "").split(",")
+    return (live_properties.get("ro.dalvik.vm.native.bridge") != manifest.get("translator") and
+            not any(abi in live_abis for abi in manifest.get("detected_abis", [])))
+
+
+def install_official(args):
+    descriptor = load_official_descriptor(args)
+    validate_official_files(args, descriptor)
+    root, _, _ = state_paths(args)
+    root.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    staging = root.parent / (OVERLAY_NAME + ".new-%d" % os.getpid())
+    backup = root.parent / (OVERLAY_NAME + ".old-%d" % os.getpid())
+    original_bindtab = current_bindtab(args)
+    bindtab_changed = False
+    if staging.exists() or backup.exists():
+        raise BridgeError("stale transaction directory exists")
+    try:
+        staging.mkdir(mode=0o700)
+        original, _, source = property_source(args)
+        manifest = {
+            "schema": SCHEMA,
+            "backend_id": OFFICIAL_BACKEND_ID,
+            "backend_kind": "builtin-image",
+            "backend_version": descriptor["backend_version"],
+            "translator": OFFICIAL_TRANSLATOR,
+            "host_arch": "x86_64",
+            "guest_arch": "arm64",
+            "detected_abis": ["arm64-v8a"],
+            "files": descriptor["files"],
+            "native_bridge_interface_versions": [OFFICIAL_INTERFACE_VERSION],
+            "source_revision": descriptor["source_revision"],
+            "official_manifest_path": OFFICIAL_MANIFEST,
+            "enabled": False,
+            "verification": {},
+            "installed_at": int(time.time()),
+            "original_properties": parse_properties(original),
+            "property_source": source,
+        }
+        with open(staging / "manifest.json", "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(staging, 0o755)
+        atomic_bindtab(args, without_bridge_bindings(original_bindtab))
+        bindtab_changed = True
+        if root.exists():
+            os.replace(root, backup)
+        os.replace(staging, root)
+        fsync_directory(root.parent)
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists() and not root.exists():
+            os.replace(backup, root)
+        if bindtab_changed:
+            atomic_bindtab(args, original_bindtab)
+        raise
+    print("Official Berberis backend installed but disabled")
+    print("backend: " + manifest["backend_id"])
+    print("backend-version: " + manifest["backend_version"])
+    print("translator: " + manifest["translator"])
+    print("detected-abis: arm64-v8a")
+    print("advertised-abis: none (run enable, restart Android, then verify)")
+
+
+def install(args):
+    if args.backend == OFFICIAL_BACKEND_ID:
+        if args.source:
+            raise BridgeError("install berberis does not accept --source")
+        return install_official(args)
+    if not args.source:
+        raise BridgeError("install requires --source <path>")
+    root, payload, manifest_path = state_paths(args)
+    root.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    staging = root.parent / (OVERLAY_NAME + ".new-%d" % os.getpid())
+    backup = root.parent / (OVERLAY_NAME + ".old-%d" % os.getpid())
+    original_bindtab = current_bindtab(args)
+    bindtab_changed = False
+    if staging.exists() or backup.exists():
+        raise BridgeError("stale transaction directory exists")
+    try:
+        staging.mkdir(mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="anbox-native-source-") as temporary:
+            extracted = pathlib.Path(temporary) / "source"
+            copy_source(args.source, extracted)
+            validate_tree(extracted)
+            translator, abis, files, deduplicated, interfaces = build_payload(
+                extracted, staging / "payload")
+        manifest = {
+            "schema": SCHEMA,
+            "backend_id": "external",
+            "backend_kind": "external-payload",
+            "backend_version": "user-provided",
+            "translator": translator,
+            "host_arch": "x86_64",
+            "guest_arch": "arm64" if "arm64-v8a" in abis else "arm",
+            "detected_abis": abis,
+            "files": files,
+            "deduplicated_aliases": deduplicated,
+            "native_bridge_interface_versions": interfaces,
+            "enabled": False,
+            "verification": {},
+            "installed_at": int(time.time()),
+            "source_sha256": sha256(args.source) if pathlib.Path(args.source).is_file() else None,
+        }
+        original, _, source = property_source(args)
+        manifest["original_properties"] = parse_properties(
+            original)
+        manifest["property_source"] = source
+        with open(staging / "manifest.json", "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Status and the unprivileged host bridge may read validation metadata;
+        # translator payloads are already guest-readable once overlaid.
+        os.chmod(staging, 0o755)
+        # Committing a replacement always leaves it disabled. Remove only our
+        # previous bindings after the new payload and manifest are durable.
+        atomic_bindtab(args, without_bridge_bindings(original_bindtab))
+        bindtab_changed = True
+        if root.exists():
+            os.replace(root, backup)
+        os.replace(staging, root)
+        fsync_directory(root.parent)
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists() and not root.exists():
+            os.replace(backup, root)
+        if bindtab_changed:
+            atomic_bindtab(args, original_bindtab)
+        raise
+    print("Native Bridge payload installed but disabled")
+    print("backend: external")
+    print("translator: " + manifest["translator"])
+    print("detected-abis: " + (",".join(manifest["detected_abis"]) or "none"))
+    print("advertised-abis: none (run enable, restart Android, then verify)")
+
+
+def save_manifest(args, manifest):
+    _, _, path = state_paths(args)
+    temporary = path.with_suffix(".json.tmp")
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def enable(args):
+    manifest = load_manifest(args)
+    if args.backend and manifest["backend_id"] != args.backend:
+        raise BridgeError("installed Native Bridge backend is %s, not %s" %
+                          (manifest["backend_id"], args.backend))
+    root, payload, _ = state_paths(args)
+    lines = without_bridge_bindings(current_bindtab(args))
+    built_image = None
+    if manifest["backend_kind"] == "builtin-image":
+        validate_official_files(args, manifest)
+    else:
+        for item in manifest["files"]:
+            relative = pathlib.Path(item["path"].lstrip("/"))
+            source = payload / relative
+            if not source.is_file() or source.is_symlink() or sha256(source) != item["sha256"]:
+                raise BridgeError("installed payload checksum failed: " + item["path"])
+        system_upper = payload / "system"
+        if not system_upper.is_dir() or system_upper.is_symlink():
+            raise BridgeError("installed payload has no safe /system overlay tree")
+        built_image = build_managed_image(args, manifest)
+    prop_overlay, _ = write_property_overlay(args, manifest)
+    _, property_relative, _ = property_source(args)
+    prop_target = pathlib.Path(args.data_dir) / "combined-rootfs" / property_relative
+    lines.append("%s %s none bind,create=file,optional,ro 0 0" %
+                 (prop_overlay, prop_target))
+    previous_enabled = bool(manifest.get("enabled"))
+    manifest["enabled"] = True
+    save_manifest(args, manifest)
+    marker = enabled_marker(args)
+    try:
+        marker_value = ("builtin-image-v1\n" if manifest["backend_kind"] == "builtin-image"
+                        else "managed-system-overlay-v1\n")
+        marker.write_text(marker_value, encoding="utf-8")
+        os.chmod(marker, 0o600)
+        fsync_directory(marker.parent)
+        atomic_bindtab(args, lines)
+    except Exception:
+        marker.unlink(missing_ok=True)
+        manifest["enabled"] = previous_enabled
+        save_manifest(args, manifest)
+        raise
+    if built_image:
+        print("Native Bridge enabled using managed image clone: " + str(built_image))
+    else:
+        print("Official Berberis backend enabled from the project-built Android image")
+    print("Original Android image was not modified: " + str(args.android_image))
+    print("Restart the Android container before running verify")
+
+
+def disable(args, quiet=False):
+    try:
+        manifest = load_manifest(args)
+    except BridgeError:
+        manifest = None
+    original_lines = current_bindtab(args)
+    if manifest:
+        previous_enabled = bool(manifest.get("enabled"))
+        manifest["enabled"] = False
+        save_manifest(args, manifest)
+    try:
+        atomic_bindtab(args, without_bridge_bindings(original_lines))
+        enabled_marker(args).unlink(missing_ok=True)
+        if manifest:
+            fsync_directory(enabled_marker(args).parent)
+    except Exception:
+        if manifest:
+            manifest["enabled"] = previous_enabled
+            save_manifest(args, manifest)
+        raise
+    if not quiet:
+        print("Native Bridge disabled; original property state restored on next boot")
+
+
+def remove(args):
+    disable(args, quiet=True)
+    root, _, _ = state_paths(args)
+    if root.exists():
+        shutil.rmtree(root)
+        fsync_directory(root.parent)
+    print("Native Bridge overlay removed; Android images were not modified")
+
+
+PROBE_PACKAGE = "org.anbox.reboxed.nativebridge.probe"
+PROBE_COMPONENT = PROBE_PACKAGE + "/.ProbeInstrumentation"
+PROBE_ACTIVITY = PROBE_PACKAGE + "/.ProbeActivity"
+PROBE_VALUES = {"armeabi-v7a": 0x320032, "arm64-v8a": 0x640064}
+SESSION_PROCESSES = []
+
+
+def privilege_prefix():
+    return [] if os.geteuid() == 0 else ["sudo"]
+
+
+def container_state(args):
+    command = privilege_prefix() + ["lxc-info", "-P", args.container_path,
+                                    "-n", args.container, "-sH"]
+    result = subprocess.run(command, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            timeout=args.test_timeout)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def android_command(args, command, timeout=None):
+    attach = privilege_prefix() + ["lxc-attach", "-P", args.container_path,
+                                   "-n", args.container, "--"]
+    return subprocess.run(attach + list(command), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True,
+                          timeout=timeout or args.test_timeout)
+
+
+def command_output(result):
+    return (result.stdout + result.stderr).strip()[:2048]
+
+
+def capture_diagnostics(args, label, since=None):
+    root, _, _ = state_paths(args)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    safe_label = re.sub(r"[^a-z0-9_.-]+", "-", label.lower()).strip("-")
+    output = root / "diagnostics" / (stamp + "-" + safe_label)
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+
+    def record(name, command, timeout=20):
+        try:
+            result = subprocess.run(command, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=timeout)
+            content = result.stdout
+        except (OSError, subprocess.TimeoutExpired) as error:
+            content = ("diagnostic command failed: " + str(error) + "\n").encode()
+        path = output / name
+        path.write_bytes(content[:16 * 1024 * 1024])
+        os.chmod(path, 0o600)
+
+    attach = privilege_prefix() + ["lxc-attach", "-P", args.container_path,
+                                   "-n", args.container, "--"]
+    record("container-state.txt", privilege_prefix() + [
+        "lxc-info", "-P", args.container_path, "-n", args.container])
+    record("getprop.txt", attach + ["/system/bin/getprop"])
+    record("processes.txt", attach + ["/system/bin/ps", "-A"])
+    record("logcat-all.txt", attach + ["/system/bin/logcat", "-d", "-b", "all",
+                                               "-v", "threadtime"], timeout=30)
+    journal = privilege_prefix() + ["journalctl", "-u", args.container_service,
+                                    "--no-pager", "-o", "short-precise"]
+    if since:
+        journal.extend(["--since", "@%d" % int(since)])
+    record("container-manager-journal.txt", journal, timeout=30)
+    for source, name in ((pathlib.Path(args.container_path) / args.container / "config",
+                          "lxc-config.txt"),
+                         (root / "verify-session.log", "verify-session.log"),
+                         (root / "manifest.json", "manifest.json"),
+                         (bindtab_path(args), "bindtab.txt")):
+        try:
+            if source.is_file() and not source.is_symlink():
+                shutil.copyfile(source, output / name)
+                os.chmod(output / name, 0o600)
+        except OSError:
+            pass
+    data = pathlib.Path(args.data_dir) / "data"
+    for relative in ("tombstones", "anr", "system/dropbox"):
+        source_root = data / relative
+        if not source_root.is_dir():
+            continue
+        destination_root = output / "android-data" / relative
+        for source in source_root.rglob("*"):
+            try:
+                info = source.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024 or
+                        (since and info.st_mtime + 2 < since)):
+                    continue
+                destination = destination_root / source.relative_to(source_root)
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                os.chmod(destination, 0o600)
+            except OSError:
+                continue
+    return output
+
+
+def ensure_guest(args):
+    code, state, detail = container_state(args)
+    if code or state != "RUNNING":
+        raise BridgeError("guest unavailable: container %s at %s is %s%s" % (
+            args.container, args.container_path, state or "unavailable",
+            (": " + detail) if detail else ""))
+    result = android_command(args, ["/system/bin/cmd", "package", "list",
+                                    "packages", "--user", "0"])
+    if result.returncode:
+        raise BridgeError("guest unavailable: Android PackageManager is unavailable: " +
+                          command_output(result))
+
+
+def validate_probe_apk(path):
+    probe = pathlib.Path(path)
+    if not probe.is_file() or probe.is_symlink():
+        raise BridgeError("Native Bridge probe APK is unavailable: " + str(probe))
+    expected = {
+        "lib/arm64-v8a/libreboxed_native_bridge_probe.so": (64, "arm64"),
+        "lib/armeabi-v7a/libreboxed_native_bridge_probe.so": (32, "arm"),
+    }
+    try:
+        with zipfile.ZipFile(probe) as archive, tempfile.TemporaryDirectory(
+                prefix="anbox-native-probe-") as raw:
+            names = set(archive.namelist())
+            for member, elf_expected in expected.items():
+                if member not in names:
+                    raise BridgeError("Native Bridge probe APK is missing " + member)
+                output = pathlib.Path(raw) / pathlib.Path(member).name
+                output.write_bytes(archive.read(member))
+                if elf_info(output) != elf_expected:
+                    raise BridgeError("Native Bridge probe APK has an invalid " + member)
+    except zipfile.BadZipFile as error:
+        raise BridgeError("Native Bridge probe APK is invalid: " + str(error))
+    return probe
+
+
+def copy_probe(args, source):
+    name = ".reboxed-native-bridge-probe-%d-%x.apk" % (
+        os.getpid(), time.time_ns())
+    target = "/data/local/tmp/" + name
+    attach = privilege_prefix() + ["lxc-attach", "-P", args.container_path,
+                                   "-n", args.container, "--"]
+    try:
+        with open(source, "rb") as stream:
+            copied = subprocess.run(
+                attach + ["/system/bin/dd", "of=" + target, "bs=65536"],
+                stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=args.test_timeout)
+    except OSError as error:
+        raise BridgeError("guest unavailable: could not copy Native Bridge probe: " +
+                          str(error)) from error
+    if copied.returncode:
+        detail = (copied.stdout + copied.stderr).decode(
+            "utf-8", errors="replace").strip()[:2048]
+        raise BridgeError("guest unavailable: could not copy Native Bridge probe: " +
+                          (detail or "lxc-attach dd failed"))
+    mode = android_command(args, ["/system/bin/chmod", "0644", target])
+    if mode.returncode:
+        android_command(args, ["/system/bin/rm", "-f", target])
+        raise BridgeError("guest unavailable: could not set Native Bridge probe permissions: " +
+                          command_output(mode))
+    return target
+
+
+def remove_guest_probe_file(args, guest_apk):
+    result = android_command(args, ["/system/bin/rm", "-f", guest_apk])
+    return None if result.returncode == 0 else command_output(result)
+
+
+def package_install(args, guest_apk, size, abi):
+    create = android_command(args, ["/system/bin/cmd", "package", "install-create",
+                                    "-r", "--user", "0", "--abi", abi])
+    output = command_output(create)
+    match = re.search(r"\[(\d+)\]", output)
+    if create.returncode or not match:
+        state = "unsupported-abi" if re.search(
+            r"unsupported|not supported|no matching|invalid abi|INSTALL_FAILED_NO_MATCHING_ABIS",
+            output, re.I) else "probe-apk-install-failed"
+        return None, state, output or "PackageInstaller did not create a session"
+    session = match.group(1)
+    write = android_command(args, ["/system/bin/cmd", "package", "install-write",
+                                   "-S", str(size), session, "base.apk", guest_apk])
+    if write.returncode or "Success" not in command_output(write):
+        android_command(args, ["/system/bin/cmd", "package", "install-abandon", session])
+        return None, "probe-apk-install-failed", command_output(write)
+    try:
+        commit = android_command(args, ["/system/bin/cmd", "package", "install-commit", session],
+                                 timeout=max(args.test_timeout, 60))
+    except subprocess.TimeoutExpired:
+        # Some PackageInstaller versions lose the shell callback after the
+        # package has already been committed. Never infer success from the
+        # timeout: query PackageManager and the selected primary ABI.
+        package_path = android_command(
+            args, ["/system/bin/cmd", "package", "path", "--user", "0", PROBE_PACKAGE])
+        package_state = android_command(
+            args, ["/system/bin/dumpsys", "package", PROBE_PACKAGE])
+        expected_primary = "primaryCpuAbi=" + abi
+        if (package_path.returncode == 0 and "package:" in package_path.stdout and
+                package_state.returncode == 0 and expected_primary in package_state.stdout):
+            return session, "installed", (
+                "PackageInstaller callback timed out; PackageManager confirmed %s" %
+                expected_primary)
+        return None, "probe-apk-install-failed", (
+            "PackageInstaller callback timed out and PackageManager did not confirm %s; %s" %
+            (expected_primary, command_output(package_state)))
+    output = command_output(commit)
+    if commit.returncode or "Success" not in output:
+        state = "unsupported-abi" if re.search(
+            r"unsupported|not supported|no matching|INSTALL_FAILED_NO_MATCHING_ABIS", output, re.I
+        ) else "probe-apk-install-failed"
+        return None, state, output
+    return session, "installed", output
+
+
+def probe_package_installed(args):
+    result = android_command(
+        args, ["/system/bin/cmd", "package", "path", "--user", "0", PROBE_PACKAGE])
+    return result.returncode == 0 and "package:" in result.stdout
+
+
+def remove_probe_package(args):
+    if not probe_package_installed(args):
+        return None
+    try:
+        result = android_command(args, ["/system/bin/cmd", "package", "uninstall",
+                                        "--user", "0", PROBE_PACKAGE], timeout=15)
+    except subprocess.TimeoutExpired:
+        return None if not probe_package_installed(args) else \
+            "probe APK uninstall callback timed out and package remains installed"
+    output = command_output(result)
+    if not probe_package_installed(args):
+        return None
+    return output or "probe APK uninstall failed"
+
+
+def instrumentation_outcome(abi, result, token=""):
+    output = command_output(result)
+    prefix = (token + "|") if token else ""
+    expected = prefix + "JNI_SUCCEEDED|%s|%d" % (abi, PROBE_VALUES[abi])
+    if expected in output and result.returncode == 0:
+        return True, "jni-call-succeeded", output
+    if prefix + "LOAD_FAILED|%s|" % abi in output:
+        return False, "native-bridge-library-load-failed", output
+    if prefix + "JNI_FAILED|%s|" % abi in output:
+        return False, "jni-call-failed", output
+    return False, "probe-result-unavailable", output or "Android probe returned no result"
+
+
+def probe_logcat(args):
+    return android_command(args, ["/system/bin/logcat", "-d", "-s",
+                                  "ReboxedNativeBridgeProbe:I", "*:S"])
+
+
+def activity_probe_fallback(args, abi, token, prior_result):
+    # Android 15's legacy /system/bin/am instrument client is not usable on
+    # every reconstructed GSI framework: it can exit 0 without contacting
+    # ActivityManager or producing output. A normal Activity launch still
+    # exercises PackageManager, Zygote, ART, Native Bridge, and the exact same
+    # JNI method. Use it only when neither instrumentation nor logcat produced
+    # the nonce-qualified result.
+    launch = android_command(args, ["/system/bin/cmd", "activity", "start-activity",
+                                    "--user", "0", "-n", PROBE_ACTIVITY,
+                                    "--es", "expectedAbi", abi,
+                                    "--es", "probeToken", token])
+    deadline = time.monotonic() + args.test_timeout
+    logcat = probe_logcat(args)
+    while token not in command_output(logcat) and time.monotonic() < deadline:
+        time.sleep(0.25)
+        logcat = probe_logcat(args)
+    return subprocess.CompletedProcess(
+        prior_result.args,
+        prior_result.returncode if launch.returncode == 0 else launch.returncode,
+        stdout=(prior_result.stdout + "\n" + launch.stdout + "\n" + logcat.stdout),
+        stderr=(prior_result.stderr + "\n" + launch.stderr + "\n" + logcat.stderr))
+
+
+def restart_guest(args):
+    user = args.session_user
+    if not user or user == "root":
+        raise BridgeError("guest unavailable: verification needs the desktop session owner; use --session-user USER")
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError:
+        raise BridgeError("guest unavailable: session user does not exist: " + user)
+    stop = privilege_prefix() + ["pkill", "-TERM", "-u", str(account.pw_uid),
+                                 "-f", r"[/](anbox|anbox-reboxed) session-manager"]
+    subprocess.run(stop, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=args.test_timeout)
+    stop_deadline = time.monotonic() + 60
+    while time.monotonic() < stop_deadline:
+        code, state, _ = container_state(args)
+        if code != 0 or state == "STOPPED":
+            break
+        time.sleep(1)
+    else:
+        raise BridgeError("guest unavailable: desktop session did not stop container %s at %s" % (
+            args.container, args.container_path))
+
+    service = privilege_prefix() + ["systemctl", "restart", args.container_service]
+    result = subprocess.run(service, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=max(args.test_timeout, 60))
+    if result.returncode:
+        raise BridgeError("guest unavailable: failed to restart %s: %s" % (
+            args.container_service, command_output(result)))
+    socket_path = pathlib.Path(args.manager_socket)
+    ready_deadline = time.monotonic() + 60
+    while time.monotonic() < ready_deadline:
+        if socket_path.is_socket():
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                client.settimeout(1)
+                client.connect(str(socket_path))
+                break
+            except OSError:
+                pass
+            finally:
+                client.close()
+        time.sleep(0.25)
+    else:
+        raise BridgeError("guest unavailable: container manager socket did not become ready: " +
+                          str(socket_path))
+
+    # The manager publishes its control socket before all post-start image and
+    # graphics preparation has quiesced. combined-rootfs itself is populated
+    # lazily by the subsequent start request, so it cannot be used as a gate.
+    # A short socket-stability interval avoids the observed early KeyMint HAL
+    # registration race and also lets a prior gfxstream instance release its
+    # device state before the replacement session starts.
+    time.sleep(10)
+
+    binary = shutil.which("anbox-reboxed") or "/usr/local/bin/anbox-reboxed"
+    if not pathlib.Path(binary).is_file():
+        raise BridgeError("guest unavailable: anbox-reboxed executable is unavailable")
+    environment = os.environ.copy()
+    environment.update({
+        "HOME": account.pw_dir,
+        "USER": user,
+        "LOGNAME": user,
+        "DISPLAY": args.display,
+        "XAUTHORITY": args.xauthority or str(pathlib.Path(account.pw_dir) / ".Xauthority"),
+        "XDG_RUNTIME_DIR": "/run/user/%d" % account.pw_uid,
+    })
+    command = [binary, "session-manager", "--single-window",
+               "--window-size=720x1280", "--orientation=portrait",
+               "--no-touch-emulation", "--no-dbus-service"]
+    if os.geteuid() == 0:
+        command = ["sudo", "-u", user, "--", "env",
+                   "HOME=" + account.pw_dir, "USER=" + user, "LOGNAME=" + user,
+                   "DISPLAY=" + args.display,
+                   "XAUTHORITY=" + environment["XAUTHORITY"],
+                   "XDG_RUNTIME_DIR=" + environment["XDG_RUNTIME_DIR"]] + command
+    root, _, _ = state_paths(args)
+    session_log = root / "verify-session.log"
+    log = open(session_log, "ab", buffering=0)
+    os.chmod(session_log, 0o600)
+    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                               env=environment, start_new_session=True)
+    SESSION_PROCESSES.append((process, log))
+    deadline = time.monotonic() + args.boot_timeout
+    last = "container not running"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            log.close()
+            detail = session_log.read_text(encoding="utf-8", errors="replace")[-2048:]
+            raise BridgeError("guest unavailable: replacement session manager exited: " + detail)
+        try:
+            code, state, detail = container_state(args)
+            last = detail or state
+            if code == 0 and state == "RUNNING":
+                boot = android_command(args, ["/system/bin/getprop",
+                                              "sys.boot_completed"])
+                last = command_output(boot)
+                if boot.returncode == 0 and boot.stdout.strip() == "1":
+                    return
+        except (OSError, subprocess.TimeoutExpired) as error:
+            last = str(error)
+        time.sleep(1)
+    raise BridgeError("guest unavailable: Android did not boot after restarting %s at %s: %s" % (
+        args.container, args.container_path, last))
+
+
+def write_file_in_place(path, content, mode=0o644):
+    if path.is_symlink() or not path.is_file():
+        raise BridgeError("Native Bridge property overlay is unsafe: " + str(path))
+    with open(path, "wb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(path, mode)
+
+
+def active_property_overlay(args):
+    root, _, _ = state_paths(args)
+    directory = root / "properties"
+    candidates = [path for path in directory.rglob("*")
+                  if path.is_file() and not path.is_symlink() and ".tmp" not in path.name]
+    if len(candidates) != 1:
+        raise BridgeError("Native Bridge property overlay discovery expected one file under %s; found: %s" % (
+            directory, ", ".join(str(path) for path in candidates) or "none"))
+    return candidates[0]
+
+
+def verify_one_abi(args, manifest, abi, guest_apk, host_apk):
+    record = {"passed": False, "state": "jni-call-failed",
+              "probe_sha256": sha256(host_apk), "tested_at": int(time.time()),
+              "temporary_properties": "restored"}
+    session = None
+    cleanup = []
+    property_path = None
+    property_content = None
+    property_mode = 0o644
+    try:
+        property_path = active_property_overlay(args)
+        property_content = property_path.read_bytes()
+        property_mode = stat.S_IMODE(property_path.stat().st_mode)
+        temporary_text = merged_property_text(
+            property_content.decode("utf-8"),
+            property_updates(manifest, manifest.get("verification", {}),
+                             temporary_abis=[abi]))
+        write_file_in_place(property_path, temporary_text.encode("utf-8"),
+                            property_mode)
+        try:
+            restart_guest(args)
+        except BridgeError as error:
+            # The manager/session transport can fail independently of the
+            # translator. Only a running container that never reaches Android
+            # boot completion is evidence of a Native Bridge load failure.
+            if "Android did not boot" in str(error):
+                diagnostics = capture_diagnostics(
+                    args, abi + "-temporary-boot-failure", record["tested_at"])
+                record["diagnostics"] = str(diagnostics)
+                raise BridgeError("native bridge library load failed: %s; diagnostics: %s" %
+                                  (error, diagnostics))
+            raise
+        advertised = android_command(args, ["/system/bin/getprop",
+                                             "ro.product.cpu.abilist"])
+        if abi not in advertised.stdout.strip().split(","):
+            raise BridgeError("unsupported ABI: temporary Android property configuration did not expose " + abi)
+        # Remove an interrupted prior probe before creating a new ABI-specific
+        # PackageInstaller session. No app process is launched outside ART.
+        removal_error = remove_probe_package(args)
+        if removal_error:
+            raise BridgeError("probe APK install failed: " + removal_error)
+        session, state, detail = package_install(
+            args, guest_apk, host_apk.stat().st_size, abi)
+        if not session:
+            record.update({"state": state, "output": detail, "exit_code": 1})
+            return record
+        token = "%x-%x" % (os.getpid(), time.time_ns())
+        result = android_command(args, ["/system/bin/am", "instrument", "-w", "-r",
+                                        "--user", "0", "--abi", abi,
+                                        "-e", "expectedAbi", abi,
+                                        "-e", "probeToken", token, PROBE_COMPONENT],
+                                 timeout=max(args.test_timeout, 60))
+        combined = result
+        if token not in command_output(result):
+            logcat = probe_logcat(args)
+            combined = subprocess.CompletedProcess(
+                result.args, result.returncode,
+                stdout=(result.stdout + "\n" + logcat.stdout),
+                stderr=(result.stderr + "\n" + logcat.stderr))
+        if token not in command_output(combined):
+            combined = activity_probe_fallback(args, abi, token, combined)
+        passed, state, detail = instrumentation_outcome(abi, combined, token)
+        record.update({"passed": passed, "state": state, "output": detail,
+                       "exit_code": result.returncode})
+        return record
+    except subprocess.TimeoutExpired as error:
+        record.update({"state": "guest-unavailable", "output": "probe timed out: " + str(error),
+                       "exit_code": 124})
+        return record
+    except BridgeError as error:
+        detail = str(error)
+        if detail.startswith("native bridge library load failed:"):
+            state = "native-bridge-library-load-failed"
+        elif detail.startswith("guest unavailable:"):
+            state = "guest-unavailable"
+        elif detail.startswith("unsupported ABI:"):
+            state = "unsupported-abi"
+        elif detail.startswith("probe APK install failed:"):
+            state = "probe-apk-install-failed"
+        else:
+            state = "jni-call-failed"
+        record.update({"state": state, "output": detail, "exit_code": 1})
+        return record
+    finally:
+        if not record.get("passed") and "diagnostics" not in record:
+            try:
+                record["diagnostics"] = str(capture_diagnostics(
+                    args, abi + "-probe-failure", record["tested_at"]))
+            except (BridgeError, OSError, subprocess.TimeoutExpired) as error:
+                cleanup.append("probe diagnostics failed: " + str(error))
+        try:
+            removal_error = remove_probe_package(args)
+            if removal_error:
+                cleanup.append(removal_error)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            cleanup.append("probe APK uninstall failed: " + str(error))
+        if property_path is not None and property_content is not None:
+            try:
+                write_file_in_place(property_path, property_content, property_mode)
+                restart_guest(args)
+            except (BridgeError, OSError, subprocess.TimeoutExpired) as error:
+                cleanup.append("temporary property restore failed: " + str(error))
+        if cleanup:
+            record["passed"] = False
+            if record["state"] not in ("native-bridge-library-load-failed",
+                                        "guest-unavailable"):
+                record["state"] = "probe-apk-install-failed"
+            record["output"] = (record.get("output", "") + "; " + "; ".join(cleanup)).strip("; ")
+
+
+def verify(args):
+    manifest = load_manifest(args)
+    if not manifest.get("enabled"):
+        raise BridgeError("Native Bridge must be enabled and Android restarted before verify")
+    prior_verification = dict(manifest.get("verification", {}))
+    # First prove that Android 15 can complete a normal boot with only the
+    # Native Bridge library property. ABI remapping and ARM ABI advertisement
+    # are deliberately absent from this baseline compatibility gate.
+    baseline_started = int(time.time())
+    write_property_overlay(args, manifest)
+    try:
+        restart_guest(args)
+    except BridgeError as error:
+        diagnostics = capture_diagnostics(args, "baseline-boot-failure",
+                                          baseline_started)
+        manifest["compatibility_failure"] = {
+            "state": "native-bridge-library-load-failed",
+            "output": str(error),
+            "diagnostics": str(diagnostics),
+            "tested_at": baseline_started,
+        }
+        save_manifest(args, manifest)
+        disable(args, quiet=True)
+        try:
+            restart_guest(args)
+        except BridgeError as recovery_error:
+            raise BridgeError("Native Bridge baseline boot failed; diagnostics: %s; "
+                              "guest recovery failed: %s" %
+                              (diagnostics, recovery_error))
+        raise BridgeError("Native Bridge baseline boot failed; overlay disabled and "
+                          "Android recovered; diagnostics: " + str(diagnostics))
+    script = pathlib.Path(__file__).resolve()
+    candidates = [
+        pathlib.Path(args.probe_apk) if args.probe_apk else None,
+        script.parents[1] / "data/native-bridge-tests/ReboxedNativeBridgeProbe.apk",
+        script.parents[2] / "share/anbox/native-bridge-tests/ReboxedNativeBridgeProbe.apk",
+    ]
+    probe = validate_probe_apk(next((path for path in candidates
+                                     if path is not None and path.is_file()),
+                                    candidates[-1]))
+    guest_apk = copy_probe(args, probe)
+    results = dict(manifest.get("verification", {}))
+    failures = []
+    cleanup_error = None
+    try:
+        for abi in manifest["detected_abis"]:
+            results[abi] = verify_one_abi(args, manifest, abi, guest_apk, probe)
+            print("%s: %s (%s)" % (
+                abi, "passed" if results[abi]["passed"] else "failed",
+                results[abi]["state"]))
+            if not results[abi]["passed"]:
+                failures.append(abi)
+            if results[abi]["state"] == "native-bridge-library-load-failed":
+                break
+    finally:
+        cleanup_error = remove_guest_probe_file(args, guest_apk)
+    manifest["verification"] = results
+    save_manifest(args, manifest)
+    if cleanup_error:
+        raise BridgeError("Native Bridge probe APK cleanup failed: " + cleanup_error)
+    load_failed = any(result.get("state") == "native-bridge-library-load-failed"
+                      for result in results.values())
+    if load_failed:
+        # A translator that prevents Android from booting must not be left
+        # enabled. Disable removes only our bind entries and restores the
+        # original image properties; the normal session-manager path then
+        # recreates a bootable guest.
+        disable(args, quiet=True)
+        try:
+            restart_guest(args)
+        except BridgeError as error:
+            raise BridgeError("Native Bridge boot failed and guest recovery failed: " + str(error))
+        raise BridgeError("Android-process JNI verification failed: Native Bridge library load failed")
+    # Commit the passing ABI set into Android's pre-init property source. The
+    # activation restart is required both for ro.* immutability and because an
+    # active bind mount otherwise retains the pre-replacement overlay inode.
+    try:
+        activate_persistent_properties(args, manifest)
+    except (BridgeError, OSError, subprocess.TimeoutExpired) as error:
+        manifest["verification"] = prior_verification
+        save_manifest(args, manifest)
+        try:
+            activate_persistent_properties(args, manifest)
+        except (BridgeError, OSError, subprocess.TimeoutExpired) as recovery_error:
+            raise BridgeError("verified ABI property activation failed: %s; "
+                              "previous property state recovery failed: %s" %
+                              (error, recovery_error))
+        raise BridgeError("verified ABI property activation failed; previous "
+                          "property state restored: " + str(error))
+    advertised = [abi for abi, result in results.items() if result.get("passed")]
+    print("advertised-abis-active: " + (",".join(advertised) or "none"))
+    if failures:
+        reasons = ["%s=%s" % (abi, results[abi]["state"]) for abi in failures]
+        raise BridgeError("Android-process JNI verification failed: " + ",".join(reasons))
+
+
+def status(args):
+    try:
+        manifest = load_manifest(args)
+    except BridgeError as error:
+        print("installed: false")
+        print("enabled: false")
+        print("detail: " + str(error))
+        return
+    configured = (enabled_marker(args).is_file() and
+                  any("/state/native-bridge/properties/" in line
+                      for line in current_bindtab(args)))
+    checksum_ok = True
+    checksum_error = None
+    _, payload, _ = state_paths(args)
+    if manifest["backend_kind"] == "builtin-image":
+        try:
+            validate_official_files(args, manifest)
+        except BridgeError as error:
+            checksum_ok = False
+            checksum_error = str(error)
+    else:
+        for item in manifest["files"]:
+            path = payload / item["path"].lstrip("/")
+            checksum_ok &= (path.is_file() and not path.is_symlink() and
+                            stat.S_IMODE(path.stat().st_mode) == item.get("mode", 0o644) and
+                            sha256(path) == item["sha256"])
+    passed = [abi for abi, result in manifest.get("verification", {}).items()
+              if result.get("passed")]
+    live_properties = live_native_bridge_properties(args)
+    advertised = effective_advertised_abis(manifest, configured, live_properties)
+    print("installed: true")
+    print("enabled: " + str(bool(manifest.get("enabled") and configured)).lower())
+    print("backend: " + manifest["backend_id"])
+    print("backend-kind: " + manifest["backend_kind"])
+    print("backend-version: " + manifest["backend_version"])
+    print("translator: " + manifest["translator"])
+    print("detected-abis: " + (",".join(manifest["detected_abis"]) or "none"))
+    print("verified-abis: " + (",".join(passed) or "none"))
+    print("advertised-abis: " + (",".join(advertised) or "none"))
+    if live_properties is None:
+        print("live-android-state: unavailable")
+    else:
+        print("live-android-abilist: " +
+              (live_properties.get("ro.product.cpu.abilist") or "none"))
+        print("live-android-abilist32: " +
+              (live_properties.get("ro.product.cpu.abilist32") or "none"))
+        print("live-android-abilist64: " +
+              (live_properties.get("ro.product.cpu.abilist64") or "none"))
+        print("live-android-native-bridge: " +
+              (live_properties.get("ro.dalvik.vm.native.bridge") or "none"))
+        print("live-state-matches: " +
+              str(live_state_matches_configuration(
+                  manifest, configured, live_properties)).lower())
+    print("checksums-valid: " + str(checksum_ok).lower())
+    print("image-modified: false")
+    if not checksum_ok:
+        detail = (": " + checksum_error) if checksum_error else ""
+        raise BridgeError("installed Native Bridge payload permissions or checksums are invalid" +
+                          detail)
+
+
+def parser():
+    value = argparse.ArgumentParser(add_help=False)
+    value.add_argument("action", choices=("install", "enable", "disable",
+                                           "remove", "status", "verify"))
+    value.add_argument("backend", nargs="?", choices=(OFFICIAL_BACKEND_ID, "external"))
+    value.add_argument("--source")
+    value.add_argument("--data-dir", default=os.environ.get(
+        "ANBOX_DATA_DIR", "/var/lib/anbox"))
+    value.add_argument("--android-image", default=os.environ.get(
+        "ANBOX_ANDROID_IMAGE", "/var/lib/anbox/android.img"))
+    value.add_argument("--container-path", default="/var/lib/anbox/containers")
+    value.add_argument("--container", default="default")
+    value.add_argument("--probe-apk")
+    value.add_argument("--test-timeout", type=int, default=30)
+    value.add_argument("--boot-timeout", type=int, default=180)
+    value.add_argument("--session-user", default=os.environ.get("SUDO_USER") or
+                       (os.environ.get("USER") if os.geteuid() != 0 else None))
+    value.add_argument("--display", default=os.environ.get("DISPLAY", ":0"))
+    value.add_argument("--xauthority", default=os.environ.get("XAUTHORITY"))
+    value.add_argument("--container-service", default="anbox-container-manager.service")
+    value.add_argument("--manager-socket", default="/run/anbox-container.socket")
+    value.add_argument("-h", "--help", action="help")
+    return value
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        if args.backend and args.action not in ("install", "enable"):
+            raise BridgeError("a backend selector is supported only by install and enable")
+        globals()[args.action.replace("-", "_")](args)
+        return 0
+    except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("Error: " + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

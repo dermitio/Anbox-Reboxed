@@ -1,0 +1,26 @@
+[Unit]
+Description=Reboxed Bridge host service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anbox-reboxed bridge daemon
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%t/anbox -%h/.local/state/anbox-reboxed
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RuntimeDirectory=anbox/sockets
+RuntimeDirectoryMode=0777
+StateDirectory=anbox-reboxed/bridge
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=graphical-session.target

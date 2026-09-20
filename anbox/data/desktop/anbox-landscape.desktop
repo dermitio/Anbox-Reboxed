@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Anbox Reboxed — Landscape
+GenericName=Anbox Reboxed Android Runtime
+Comment=Start Anbox Reboxed in landscape orientation
+Exec=anbox-reboxed-window --orientation landscape
+Icon=anbox-reboxed
+Terminal=false
+Type=Application
+Categories=System;Emulator;
+StartupNotify=true

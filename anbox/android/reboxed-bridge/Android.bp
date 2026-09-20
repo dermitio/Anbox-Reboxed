@@ -1,0 +1,11 @@
+android_app {
+    name: "ReboxedBridge",
+    stem: "ReboxedBridge",
+    manifest: "AndroidManifest.xml",
+    srcs: ["src/**/*.kt"],
+    resource_dirs: ["res"],
+    certificate: "platform",
+    privileged: true,
+    platform_apis: true,
+    optimize: { enabled: true },
+}

@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="210mm"
+   height="297mm"
+   viewBox="0 0 210 297"
+   version="1.1"
+   id="svg1"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   sodipodi:docname="reboxxed.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#505050"
+     bordercolor="#ffffff"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="1"
+     inkscape:deskcolor="#505050"
+     inkscape:document-units="mm"
+     inkscape:zoom="1.4128928"
+     inkscape:cx="339.37465"
+     inkscape:cy="630.97497"
+     inkscape:window-width="1920"
+     inkscape:window-height="1011"
+     inkscape:window-x="0"
+     inkscape:window-y="32"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs1">
+    <inkscape:path-effect
+       effect="spiro"
+       id="path-effect3"
+       is_visible="true"
+       lpeversion="1" />
+  </defs>
+  <rect
+     style="display:inline;fill:#ffffff;stroke:#000000;stroke-width:1.4;stroke-linecap:square;stroke-miterlimit:0;stroke-dasharray:none;stroke-dashoffset:205.455;paint-order:markers fill stroke"
+     id="rect3"
+     width="127.64838"
+     height="107.52125"
+     x="33.103828"
+     y="120.76278" />
+  <g
+     inkscape:groupmode="layer"
+     id="layer1"
+     inkscape:label="Layer 1">
+    <rect
+       style="fill:#786721;stroke:#000000;stroke-width:1.4;stroke-linecap:square;stroke-miterlimit:0;stroke-dashoffset:205.455;paint-order:markers fill stroke;stroke-dasharray:none"
+       id="rect1"
+       width="81.038177"
+       height="60.911049"
+       x="61.970371"
+       y="157.57425"
+       inkscape:export-filename="Reboxed1x.png"
+       inkscape:export-xdpi="112.73281"
+       inkscape:export-ydpi="112.73281" />
+    <rect
+       style="fill:#786721;stroke:#000000;stroke-width:1.36003;stroke-linecap:square;stroke-miterlimit:0;stroke-dasharray:none;stroke-dashoffset:205.455;paint-order:markers fill stroke"
+       id="rect2"
+       width="83.988152"
+       height="20.038687"
+       x="-61.261589"
+       y="203.15883"
+       ry="0"
+       transform="matrix(0.8348195,-0.55052375,0.55611389,0.8311061,0,0)" />
+    <rect
+       style="fill:#786721;stroke:#000000;stroke-width:0.942936;stroke-linecap:square;stroke-miterlimit:0;stroke-dasharray:none;stroke-dashoffset:205.455;paint-order:markers fill stroke"
+       id="rect2-3"
+       width="85.991745"
+       height="9.4080153"
+       x="-203.16299"
+       y="91.616043"
+       ry="0"
+       transform="matrix(0.25956242,-0.96572633,0.96870814,0.24820261,0,0)" />
+    <path
+       style="fill:#abc837;stroke:#000000;stroke-width:1.4;stroke-linecap:square;stroke-miterlimit:0;stroke-dasharray:none;stroke-dashoffset:205.455;paint-order:markers fill stroke"
+       d="m 129.10495,108.58057 c -0.26865,-5.75934 -2.35184,-11.420792 -5.88026,-15.980663 -3.52842,-4.559871 -8.48587,-7.997225 -13.99347,-9.702673 -5.62441,-1.741619 -11.816949,-1.662063 -17.353157,0.342339 -5.306559,1.921257 -9.96067,5.5984 -13.057473,10.316515 -3.096804,4.718114 -4.619042,10.450912 -4.27076,16.083802 13.8954,-0.0416 27.79028,-0.25747 41.68026,-0.64767 4.29213,-0.12058 8.58379,-0.25779 12.87486,-0.41165 z"
+       id="path3"
+       inkscape:path-effect="#path-effect3"
+       inkscape:original-d="M 129.10495,108.58057 C 128.89142,94.584519 101.18235,84.788444 109.23122,82.897234 119.27009,80.538441 96.188273,80.445415 91.878063,83.239573 70.002284,97.420872 75.10101,90.54109 74.54983,109.63989 c 13.731436,-1.01244 27.96445,1.09214 41.68026,-0.64767 3.45781,-0.43861 9.89655,-2.60814 12.87486,-0.41165 z"
+       transform="matrix(0.68884184,0.01120936,-0.0122052,0.63263788,41.582959,83.581538)"
+       inkscape:export-filename="Reboxed2.png"
+       inkscape:export-xdpi="96"
+       inkscape:export-ydpi="96"
+       sodipodi:nodetypes="cssc" />
+  </g>
+</svg>

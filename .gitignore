@@ -1,0 +1,124 @@
+# Repository-consolidation evidence and archived nested Git metadata.
+/.git-repository-archive/
+
+# Machine-local assistant/editor state and local environment overrides.
+/.agents/
+/.codex/
+/.env
+/.env.*
+!/.env.example
+/.direnv/
+/.idea/
+/.vscode/
+
+# Downloaded Android/AOSP and external research source trees. These remain on
+# disk for reference and rebuilding, but are not vendored into this project.
+/android15-library-build/
+/berberis-rebuild-kit/
+/android15-gfxstream/
+/android15-goldfish-opengl/
+/berberis-android15/
+
+# Unpublished translation development remains locally available.
+/third_party/android/berberis/
+/third_party/android/native_bridge_support/
+/third_party/android/README.md
+/third_party/android/LICENSE.Apache-2.0
+/anbox/tests/selftests/BerberisLocal.cmake
+/anbox/tests/selftests/berberis_arm64_*
+/anbox/tests/selftests/arm64_elf/
+/anbox/tests/selftests/translation_sources_selftest.py
+/anbox/scripts/build-berberis-arm64-standalone
+/anbox/scripts/build-arm64-*-standalone
+/anbox/scripts/check-berberis-rebuild-kit
+/anbox/scripts/create-berberis-rebuild-kit
+/anbox/scripts/prepare-android-translation-sources
+/anbox/products/anbox_berberis_arm64.mk
+/anbox/data/native-bridge/berberis-dependencies.lock.json
+/anbox/docs/berberis-rebuild-kit.md
+/anbox/docs/native-bridge-berberis.md
+/anbox/android/native-bridge-vulkan-probe/
+/ISA_Family_checklist.md
+/berberis-arm64-runtime-*
+/.local-development/
+# Obsolete nested-repository automation and submodule metadata.
+/anbox/.gitmodules
+/anbox/.travis.yml
+/anbox/.github/
+
+# Upstream tiny-loader ELF fixtures are generated test outputs. Keep the
+# imported copies on disk for provenance, but rebuild them when those tests are
+# intentionally enabled instead of committing binaries to the project root.
+/third_party/android/berberis/tiny_loader/tests/files/
+
+# Proprietary/downloaded native-translation payloads and archives.
+/libndk_translation/
+
+# Extracted Android images, runtime payloads, and downloaded applications.
+/aosp-x86_64-Android/
+/AuroraStore-4.8.3.apk
+/gsi-vendor/vendor.img
+/gsi-vendor/vendor/
+/anbox/data/gles-compat/
+
+# Generated bootclasspath outputs; retain the Java source inputs.
+/gsi-vendor/bootclasspath-stubs/classes/
+/gsi-vendor/bootclasspath-stubs/dex/
+
+# Build trees and generated native/build-system outputs.
+/build/
+/build-*/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/CTestTestfile.cmake
+**/DartConfiguration.tcl
+**/Testing/
+**/cmake_install.cmake
+**/install_manifest.txt
+**/*.o
+**/*.so
+**/*.a
+**/*.apk
+**/*.snap
+
+# Python and general tool caches.
+**/__pycache__/
+**/*.py[cod]
+**/.cache/
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Runtime state, logs, crash data, sockets, and backups.
+/anbox-qol-backups/
+**/*.log
+**/*.pid
+**/*.sock
+/core
+/core.*
+**/*.core
+**/*.img
+**/*.qcow2
+**/*.vmdk
+**/*.iso
+**/*.apk.idsig
+**/*.keystore
+**/*.jks
+**/*.pk8
+/leisuretest.txt
+/anbox/data/USER0-RECOVERY.md
+/gsi-vendor/BOOT_STATUS.md
+
+# Large local research/experiment notes, not project documentation.
+/leisureARM.txt
+/LLLL
+/Handoff.md
+
+# Common secret-bearing private material and local credentials.
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa
+**/id_ed25519
+**/*credentials*.json
+**/*secret*.json
+anbox-prepublic-history.bundle

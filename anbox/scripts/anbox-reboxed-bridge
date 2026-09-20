@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""Unprivileged Reboxed Bridge v1 daemon and client.
+
+The wire format is length-prefixed UTF-8 JSON. File bytes are base64 encoded in
+bounded chunks. Peers are authenticated with SO_PEERCRED before their hello is
+accepted; Android clients must run as the system UID (or an explicitly allowed
+UID). No message contains a host-selected destination path.
+"""
+
+import argparse
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+
+VERSION = 1
+MAX_FRAME = 1024 * 1024
+MAX_CLIPBOARD = 1024 * 1024
+MAX_FILE = 2 * 1024 * 1024 * 1024
+MAX_APKS = 128
+CHUNK = 256 * 1024
+HISTORY_LIMIT = 200
+SYSTEM_GUEST_UIDS = {1000, 101000}
+ABI_ORDER = ("x86_64", "arm64-v8a", "x86", "armeabi-v7a", "armeabi")
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+def runtime_root():
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        raise BridgeError("XDG_RUNTIME_DIR is not set")
+    root = pathlib.Path(value)
+    info = root.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise BridgeError("XDG_RUNTIME_DIR has unsafe ownership or permissions")
+    return root / "anbox" / "sockets"
+
+
+def state_root():
+    root = pathlib.Path(os.environ.get(
+        "XDG_STATE_HOME", pathlib.Path.home() / ".local/state"))
+    return root / "anbox-reboxed" / "bridge"
+
+
+def default_socket():
+    return runtime_root() / "reboxed_bridge_v1"
+
+
+def digest_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def clean_name(name):
+    if not isinstance(name, str) or not name or len(name.encode()) > 255:
+        raise BridgeError("invalid file name")
+    if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+        raise BridgeError("file name contains path syntax")
+    cleaned = re.sub(r"[^A-Za-z0-9._() +@-]", "_", name)
+    if cleaned in ("", ".", ".."):
+        raise BridgeError("file name is unsafe")
+    return cleaned
+
+
+def secure_input(path, maximum=MAX_FILE):
+    path = pathlib.Path(path).absolute()
+    current = pathlib.Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise BridgeError("symlink paths are rejected: " + str(current))
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise BridgeError("input is not a regular file: " + str(path))
+    if info.st_size > maximum:
+        raise BridgeError("input exceeds the configured size limit")
+    return path, info.st_size
+
+
+def validate_apk_archive(path):
+    total = 0
+    with zipfile.ZipFile(path) as archive:
+        for item in archive.infolist():
+            pure = pathlib.PurePosixPath(item.filename.replace("\\", "/"))
+            if pure.is_absolute() or ".." in pure.parts:
+                raise BridgeError("APK contains a traversal path")
+            if stat.S_ISLNK(item.external_attr >> 16):
+                raise BridgeError("APK contains a symlink")
+            if item.file_size > 512 * 1024 * 1024:
+                raise BridgeError("APK contains an oversized entry")
+            total += item.file_size
+            if total > MAX_FILE:
+                raise BridgeError("APK expands beyond the size limit")
+        if "AndroidManifest.xml" not in archive.namelist():
+            raise BridgeError("APK has no AndroidManifest.xml")
+
+
+def find_aapt():
+    candidates = [os.environ.get("AAPT", ""), "aapt", "aapt2"]
+    candidates.extend([
+        "/usr/local/lib/anbox/tools/aapt",
+        "/usr/lib/android-sdk/build-tools/35.0.0/aapt",
+    ])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        found = shutil.which(candidate) if "/" not in candidate else candidate
+        if found and os.access(found, os.X_OK):
+            return found
+    raise BridgeError("aapt is required for exact APK package metadata")
+
+
+def apk_metadata(path):
+    validate_apk_archive(path)
+    result = subprocess.run([find_aapt(), "dump", "badging", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    if result.returncode:
+        raise BridgeError("aapt rejected %s: %s" %
+                          (path.name, result.stderr.strip()))
+    package = re.search(r"^package: name='([^']+)' versionCode='([^']*)' versionName='([^']*)'", result.stdout, re.M)
+    if not package:
+        raise BridgeError("cannot parse package identity from " + path.name)
+    split = re.search(r"^package:.*\bsplit='([^']+)'", result.stdout, re.M)
+    abis = set()
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            match = re.match(r"lib/([^/]+)/[^/]+\.so$", name)
+            if match:
+                abis.add(match.group(1))
+    return {
+        "path": str(path), "file": path.name, "package": package.group(1),
+        "version_code": package.group(2), "version_name": package.group(3),
+        "split": split.group(1) if split else None,
+        "abis": sorted(abis), "size": path.stat().st_size,
+        "sha256": file_digest(path),
+    }
+
+
+def file_digest(path):
+    value = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def live_abis(data_dir):
+    native = []
+    try:
+        result = subprocess.run(
+            ["anbox-reboxed", "getprop", "ro.product.cpu.abilist"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=5)
+        if result.returncode == 0:
+            native = [item for item in result.stdout.strip().split(",") if item]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not native:
+        for relative in ("combined-rootfs/system/build.prop",
+                         "combined-rootfs/system/etc/prop.default"):
+            path = pathlib.Path(data_dir) / relative
+            if not path.is_file():
+                continue
+            match = re.search(r"^ro\.product\.cpu\.abilist=(.+)$",
+                              path.read_text(encoding="utf-8", errors="replace"), re.M)
+            if match:
+                native = match.group(1).strip().split(",")
+                break
+    if not native:
+        native = ["x86_64", "x86"]
+    translated = []
+    manifest = pathlib.Path(data_dir) / "state/native-bridge/manifest.json"
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            if data.get("enabled"):
+                translated = [abi for abi, check in data.get("verification", {}).items()
+                              if check.get("passed")]
+        except (ValueError, OSError):
+            pass
+    # ro.product.cpu.abilist may already contain translated ABIs. Native means
+    # architectures directly executable by the x86 guest.
+    translated = [abi for abi in translated if abi not in ("x86", "x86_64")]
+    native = [abi for abi in native if abi not in translated]
+    return native, translated
+
+
+def split_targets_abi(split):
+    if not split:
+        return None
+    lowered = split.lower().replace("-", "_")
+    aliases = {
+        "x86_64": "x86_64", "x86": "x86", "arm64_v8a": "arm64-v8a",
+        "armeabi_v7a": "armeabi-v7a", "armeabi": "armeabi",
+    }
+    for marker, abi in aliases.items():
+        if marker in lowered:
+            return abi
+    return None
+
+
+def package_preflight(paths, data_dir):
+    if not paths or len(paths) > MAX_APKS:
+        raise BridgeError("provide between 1 and 128 APK files")
+    metadata = [apk_metadata(secure_input(path)[0]) for path in paths]
+    identities = {(item["package"], item["version_code"]) for item in metadata}
+    if len(identities) != 1:
+        raise BridgeError("base and split APK package/version identities differ")
+    bases = [item for item in metadata if item["split"] is None]
+    if len(bases) != 1:
+        raise BridgeError("bundle must contain exactly one base APK")
+    split_names = [item["split"] for item in metadata if item["split"]]
+    if len(split_names) != len(set(split_names)):
+        raise BridgeError("bundle contains duplicate split names")
+    native, translated = live_abis(data_dir)
+    effective = set(native + translated)
+    selected = []
+    rejected = []
+    for item in metadata:
+        target = split_targets_abi(item["split"])
+        if target and target not in effective:
+            rejected.append((item, "split targets unsupported ABI " + target))
+        else:
+            selected.append(item)
+    package_abis = set().union(*(set(item["abis"]) for item in selected))
+    compatible = not package_abis or bool(package_abis & effective)
+    requires = bool(package_abis) and not bool(package_abis & set(native)) and compatible
+    reason = "compatible"
+    if not compatible:
+        reason = "APK native libraries target %s; guest supports native %s and translated %s" % (
+            ",".join(sorted(package_abis)) or "none",
+            ",".join(native) or "none", ",".join(translated) or "none")
+    return {
+        "package": bases[0]["package"], "version_name": bases[0]["version_name"],
+        "version_code": bases[0]["version_code"], "selected": selected,
+        "rejected": [{"file": item["file"], "reason": reason}
+                     for item, reason in rejected],
+        "apk_abis": sorted(package_abis), "native_guest_abis": native,
+        "translated_abis": translated, "native_bridge_required": requires,
+        "compatible": compatible, "reason": reason,
+    }
+
+
+def show_preflight(value):
+    print("package: %s" % value["package"])
+    print("version: %s (%s)" % (value["version_name"], value["version_code"]))
+    print("selected-apks: " + ",".join(item["file"] for item in value["selected"]))
+    print("selected-splits: " + ",".join(item["split"] or "base" for item in value["selected"]))
+    print("apk-abis: " + (",".join(value["apk_abis"]) or "none"))
+    print("native-guest-abis: " + (",".join(value["native_guest_abis"]) or "none"))
+    print("translated-abis: " + (",".join(value["translated_abis"]) or "none"))
+    print("native-bridge-required: " + str(value["native_bridge_required"]).lower())
+    print("compatible: " + str(value["compatible"]).lower())
+    print("reason: " + value["reason"])
+    for item in value["rejected"]:
+        print("rejected-split: %s (%s)" % (item["file"], item["reason"]))
+
+
+class ClipboardBackend:
+    name = "none"
+
+    async def read(self):
+        return ""
+
+    async def write(self, text):
+        del text
+
+    async def command(self, command, input_text=None):
+        process = await asyncio.create_subprocess_exec(
+            *command, stdin=asyncio.subprocess.PIPE if input_text is not None else None,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            output, _ = await asyncio.wait_for(
+                process.communicate(input_text.encode() if input_text is not None else None), 2)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return b""
+        return output if process.returncode == 0 else b""
+
+
+class WaylandClipboard(ClipboardBackend):
+    name = "wayland"
+
+    async def read(self):
+        return (await self.command(["wl-paste", "--no-newline", "--type", "text"])).decode("utf-8", "replace")
+
+    async def write(self, text):
+        await self.command(["wl-copy", "--type", "text/plain;charset=utf-8"], text)
+
+
+class X11Clipboard(ClipboardBackend):
+    name = "x11"
+
+    async def read(self):
+        return (await self.command(["xclip", "-selection", "clipboard", "-o"])).decode("utf-8", "replace")
+
+    async def write(self, text):
+        await self.command(["xclip", "-selection", "clipboard", "-i"], text)
+
+
+def clipboard_backend(requested):
+    if requested in ("auto", "wayland") and os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy") and shutil.which("wl-paste"):
+        return WaylandClipboard()
+    if requested in ("auto", "x11") and os.environ.get("DISPLAY") and shutil.which("xclip"):
+        return X11Clipboard()
+    if requested != "none":
+        raise BridgeError("requested clipboard backend is unavailable")
+    return ClipboardBackend()
+
+
+async def read_frame(reader):
+    header = await reader.readexactly(4)
+    length = struct.unpack(">I", header)[0]
+    if length == 0 or length > MAX_FRAME:
+        raise BridgeError("invalid frame length")
+    raw = await reader.readexactly(length)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise BridgeError("invalid JSON frame") from error
+    if not isinstance(value, dict) or value.get("version") != VERSION:
+        raise BridgeError("unsupported protocol version")
+    return value
+
+
+async def write_frame(writer, value):
+    value = dict(value)
+    value["version"] = VERSION
+    raw = json.dumps(value, separators=(",", ":")).encode()
+    if len(raw) > MAX_FRAME:
+        raise BridgeError("outgoing frame exceeds limit")
+    writer.write(struct.pack(">I", len(raw)) + raw)
+    await writer.drain()
+
+
+class Peer:
+    def __init__(self, reader, writer, uid, pid):
+        self.reader = reader
+        self.writer = writer
+        self.uid = uid
+        self.pid = pid
+        self.role = None
+
+
+class Daemon:
+    def __init__(self, args):
+        self.args = args
+        self.socket = pathlib.Path(args.socket)
+        self.state = pathlib.Path(args.state_dir)
+        self.incoming = self.state / "incoming"
+        self.exports = self.state / "exports"
+        self.history_path = self.state / "history.json"
+        self.peers = set()
+        self.guest = None
+        self.transfers = {}
+        self.backend = clipboard_backend(args.clipboard_backend)
+        self.last_clipboard = None
+        self.suppress_clipboard = None
+        self.history = []
+        if self.history_path.is_file():
+            try:
+                self.history = json.loads(self.history_path.read_text(encoding="utf-8"))[-HISTORY_LIMIT:]
+            except (OSError, ValueError):
+                self.history = []
+
+    def record(self, value):
+        self.history.append(dict(value, updated_at=int(time.time())))
+        self.history = self.history[-HISTORY_LIMIT:]
+        atomic_json(self.history_path, self.history)
+
+    def native_bridge_results(self):
+        path = pathlib.Path(self.args.data_dir) / "state/native-bridge/manifest.json"
+        result = {"op": "native-bridge.results", "installed": False,
+                  "enabled": False, "verification": {}}
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            result.update({"installed": True,
+                           "enabled": bool(manifest.get("enabled")),
+                           "translator": manifest.get("translator", "unknown"),
+                           "detected_abis": manifest.get("detected_abis", []),
+                           "verification": manifest.get("verification", {})})
+        except (OSError, ValueError):
+            pass
+        return result
+
+    async def send_error(self, peer, request, message):
+        await write_frame(peer.writer, {"id": request.get("id"), "ok": False,
+                                        "error": str(message)})
+
+    async def broadcast_guest(self, value):
+        if not self.guest:
+            raise BridgeError("Android bridge service is not connected")
+        await write_frame(self.guest.writer, value)
+
+    async def clipboard_poll(self):
+        while True:
+            await asyncio.sleep(self.args.clipboard_interval)
+            try:
+                text = await self.backend.read()
+                if len(text.encode()) > MAX_CLIPBOARD:
+                    continue
+                digest = digest_text(text)
+                if digest == self.suppress_clipboard:
+                    self.suppress_clipboard = None
+                    self.last_clipboard = digest
+                    continue
+                if text and digest != self.last_clipboard and self.guest:
+                    self.last_clipboard = digest
+                    await self.broadcast_guest({"op": "clipboard.changed", "text": text,
+                                                "origin": "host", "digest": digest})
+            except (OSError, BridgeError, ConnectionError):
+                pass
+
+    async def receive_file_begin(self, peer, request):
+        transfer_id = request.get("transfer_id") or str(uuid.uuid4())
+        if not isinstance(transfer_id, str) or not re.fullmatch(
+                r"[A-Za-z0-9-]{1,64}", transfer_id):
+            raise BridgeError("invalid transfer id")
+        if transfer_id in self.transfers:
+            raise BridgeError("duplicate transfer id")
+        size = request.get("size")
+        expected = request.get("sha256")
+        name = clean_name(request.get("name"))
+        if not isinstance(size, int) or size < 0 or size > self.args.max_file_size:
+            raise BridgeError("invalid transfer size")
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise BridgeError("invalid transfer checksum")
+        self.incoming.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.incoming / (transfer_id + ".part")
+        if temporary.exists() or temporary.is_symlink():
+            raise BridgeError("unsafe transfer staging path")
+        stream = open(temporary, "xb")
+        self.transfers[transfer_id] = {
+            "id": transfer_id, "name": name, "size": size, "sha256": expected,
+            "received": 0, "hash": hashlib.sha256(), "stream": stream,
+            "path": temporary, "owner": peer, "state": "receiving",
+        }
+        self.record({"id": transfer_id, "name": name, "size": size,
+                     "direction": "android-to-host", "state": "receiving"})
+        return {"transfer_id": transfer_id}
+
+    async def receive_file_chunk(self, peer, request):
+        transfer = self.transfers.get(request.get("transfer_id"))
+        if not transfer or transfer["owner"] is not peer:
+            raise BridgeError("unknown transfer")
+        raw = request.get("data")
+        if not isinstance(raw, str) or len(raw) > (CHUNK * 4 // 3 + 8):
+            raise BridgeError("invalid transfer chunk")
+        try:
+            data = base64.b64decode(raw, validate=True)
+        except ValueError as error:
+            raise BridgeError("invalid base64 chunk") from error
+        if not data or len(data) > CHUNK or transfer["received"] + len(data) > transfer["size"]:
+            raise BridgeError("transfer exceeds declared size")
+        transfer["stream"].write(data)
+        transfer["hash"].update(data)
+        transfer["received"] += len(data)
+        return {"transfer_id": transfer["id"], "received": transfer["received"],
+                "size": transfer["size"]}
+
+    async def receive_file_end(self, peer, request):
+        transfer = self.transfers.get(request.get("transfer_id"))
+        if not transfer or transfer["owner"] is not peer:
+            raise BridgeError("unknown transfer")
+        transfer["stream"].flush()
+        os.fsync(transfer["stream"].fileno())
+        transfer["stream"].close()
+        if transfer["received"] != transfer["size"] or transfer["hash"].hexdigest() != transfer["sha256"]:
+            transfer["path"].unlink(missing_ok=True)
+            del self.transfers[transfer["id"]]
+            raise BridgeError("transfer size or checksum mismatch")
+        self.exports.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination = self.exports / transfer["name"]
+        if destination.exists():
+            destination = self.exports / (transfer["id"] + "-" + transfer["name"])
+        if destination.is_symlink():
+            raise BridgeError("unsafe export destination")
+        os.replace(transfer["path"], destination)
+        os.chmod(destination, 0o600)
+        self.record({"id": transfer["id"], "name": transfer["name"],
+                     "size": transfer["size"], "direction": "android-to-host",
+                     "state": "complete", "path": str(destination)})
+        del self.transfers[transfer["id"]]
+        return {"transfer_id": transfer["id"], "path": str(destination),
+                "state": "complete"}
+
+    async def cancel(self, transfer_id):
+        transfer = self.transfers.pop(transfer_id, None)
+        if transfer:
+            transfer["stream"].close()
+            transfer["path"].unlink(missing_ok=True)
+        self.record({"id": transfer_id, "state": "cancelled"})
+        if self.guest:
+            await write_frame(self.guest.writer, {"op": "transfer.cancel",
+                                                  "transfer_id": transfer_id})
+
+    async def dispatch(self, peer, request):
+        operation = request.get("op")
+        if operation == "status":
+            return {"connected": self.guest is not None,
+                    "protocol": VERSION, "clipboard_backend": self.backend.name,
+                    "active_transfers": len(self.transfers),
+                    "history": self.history[-20:]}
+        if operation == "clipboard.push":
+            text = request.get("text")
+            if not isinstance(text, str) or not text or len(text.encode()) > MAX_CLIPBOARD:
+                raise BridgeError("clipboard text is empty or oversized")
+            digest = digest_text(text)
+            if digest != self.last_clipboard:
+                self.suppress_clipboard = digest
+                self.last_clipboard = digest
+                await self.backend.write(text)
+            return {"digest": digest}
+        if operation == "transfer.begin":
+            return await self.receive_file_begin(peer, request)
+        if operation == "transfer.chunk":
+            return await self.receive_file_chunk(peer, request)
+        if operation == "transfer.end":
+            return await self.receive_file_end(peer, request)
+        if operation == "transfer.cancel":
+            await self.cancel(request.get("transfer_id"))
+            return {"state": "cancelled"}
+        if operation == "guest.forward":
+            if peer.role != "host":
+                raise BridgeError("only the authenticated host role may forward")
+            message = request.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("op"), str):
+                raise BridgeError("invalid forwarded message")
+            await self.broadcast_guest(message)
+            return {"forwarded": True}
+        if operation == "host.event":
+            if peer.role != "guest":
+                raise BridgeError("only the authenticated guest role may emit events")
+            event = request.get("event")
+            if not isinstance(event, dict):
+                raise BridgeError("invalid host event")
+            self.record({"kind": event.get("op", "host.event"),
+                         "state": event.get("state", "updated"),
+                         "detail": event.get("detail", "")})
+            return {"recorded": True}
+        if operation in ("android.info", "diagnostics.result", "install.result"):
+            self.record({"kind": operation, "state": request.get("state", "updated"),
+                         "detail": request.get("detail", "")})
+            return {"recorded": True}
+        raise BridgeError("unsupported operation: " + str(operation))
+
+    async def client(self, reader, writer):
+        sock = writer.get_extra_info("socket")
+        pid, uid, _ = struct.unpack("3i", sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        peer = Peer(reader, writer, uid, pid)
+        self.peers.add(peer)
+        try:
+            hello = await asyncio.wait_for(read_frame(reader), 5)
+            if hello.get("op") != "hello" or hello.get("role") not in ("host", "guest"):
+                raise BridgeError("authenticated hello required")
+            role = hello["role"]
+            allowed = set(self.args.allow_peer_uid)
+            if uid not in allowed:
+                raise BridgeError("peer uid %d is not authorized" % uid)
+            if role == "guest" and uid not in set(self.args.guest_uid):
+                raise BridgeError("guest role requires an Android system UID")
+            if role == "guest" and self.guest is not None:
+                raise BridgeError("an Android bridge peer is already connected")
+            peer.role = role
+            if role == "guest":
+                self.guest = peer
+            await write_frame(writer, {"id": hello.get("id"), "ok": True,
+                                       "protocol": VERSION, "max_frame": MAX_FRAME,
+                                       "max_file": self.args.max_file_size})
+            if role == "guest":
+                await write_frame(writer, self.native_bridge_results())
+            while True:
+                request = await read_frame(reader)
+                try:
+                    response = await self.dispatch(peer, request)
+                    await write_frame(writer, dict(response, id=request.get("id"), ok=True))
+                except (BridgeError, OSError, ValueError) as error:
+                    await self.send_error(peer, request, error)
+        except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError,
+                BridgeError, OSError):
+            pass
+        finally:
+            if self.guest is peer:
+                self.guest = None
+            self.peers.discard(peer)
+            for transfer_id, transfer in list(self.transfers.items()):
+                if transfer["owner"] is peer:
+                    transfer["stream"].close()
+                    transfer["path"].unlink(missing_ok=True)
+                    del self.transfers[transfer_id]
+            writer.close()
+            await writer.wait_closed()
+
+    async def run(self):
+        if os.geteuid() == 0:
+            raise BridgeError("the Reboxed Bridge daemon refuses to run as root")
+        self.socket.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.socket.parent == runtime_root():
+            # The directory is bind-mounted into Android. The socket itself is
+            # still authenticated with SO_PEERCRED.
+            os.chmod(self.socket.parent, 0o777)
+        if self.socket.exists() or self.socket.is_symlink():
+            if self.socket.is_socket() and self.socket.lstat().st_uid == os.getuid():
+                self.socket.unlink()
+            else:
+                raise BridgeError("refusing to replace unsafe socket path")
+        self.incoming.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.exports.mkdir(mode=0o700, parents=True, exist_ok=True)
+        server = await asyncio.start_unix_server(self.client, path=str(self.socket))
+        os.chmod(self.socket, 0o666)  # Authentication is SO_PEERCRED, not DAC.
+        print("Reboxed Bridge v1 listening on " + str(self.socket), flush=True)
+        poll = asyncio.create_task(self.clipboard_poll())
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            poll.cancel()
+            self.socket.unlink(missing_ok=True)
+
+
+async def request(args, value, stream_handler=None):
+    reader, writer = await asyncio.open_unix_connection(args.socket)
+    try:
+        await write_frame(writer, {"op": "hello", "role": "host", "id": "hello"})
+        hello = await read_frame(reader)
+        if not hello.get("ok"):
+            raise BridgeError(hello.get("error", "authentication failed"))
+        value = dict(value, id=str(uuid.uuid4()))
+        await write_frame(writer, value)
+        while True:
+            response = await read_frame(reader)
+            if response.get("id") == value["id"]:
+                if not response.get("ok"):
+                    raise BridgeError(response.get("error", "bridge request failed"))
+                return response
+            if stream_handler:
+                await stream_handler(reader, writer, response)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def send_file(args, path, operation="file.receive", extra=None):
+    source, size = secure_input(path)
+    checksum = file_digest(source)
+    transfer_id = str(uuid.uuid4())
+    reader, writer = await asyncio.open_unix_connection(args.socket)
+    try:
+        await write_frame(writer, {"op": "hello", "role": "host", "id": "hello"})
+        if not (await read_frame(reader)).get("ok"):
+            raise BridgeError("bridge authentication failed")
+        await write_frame(writer, {"op": "guest.forward", "id": transfer_id,
+                                   "message": dict(extra or {}, op=operation,
+                                                   transfer_id=transfer_id,
+                                                   name=source.name, size=size,
+                                                   sha256=checksum)})
+        response = await read_frame(reader)
+        if not response.get("ok"):
+            raise BridgeError(response.get("error", "Android peer unavailable"))
+        sent = 0
+        with open(source, "rb") as stream:
+            while True:
+                data = stream.read(CHUNK)
+                if not data:
+                    break
+                await write_frame(writer, {"op": "guest.forward", "id": transfer_id,
+                                           "message": {"op": "transfer.chunk",
+                                                       "transfer_id": transfer_id,
+                                                       "data": base64.b64encode(data).decode()}})
+                response = await read_frame(reader)
+                if not response.get("ok"):
+                    raise BridgeError(response.get("error", "transfer failed"))
+                sent += len(data)
+                print("progress: %d/%d" % (sent, size))
+        await write_frame(writer, {"op": "guest.forward", "id": transfer_id,
+                                   "message": {"op": "transfer.end",
+                                               "transfer_id": transfer_id}})
+        response = await read_frame(reader)
+        if not response.get("ok"):
+            raise BridgeError(response.get("error", "transfer commit failed"))
+        return transfer_id
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+def add_common(value):
+    value.add_argument("--socket", default=None)
+    value.add_argument("--state-dir", default=str(state_root()))
+    value.add_argument("--data-dir", default=os.environ.get("ANBOX_DATA_DIR", "/var/lib/anbox"))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="action", required=True)
+    daemon = sub.add_parser("daemon")
+    add_common(daemon)
+    daemon.add_argument("--clipboard-backend", choices=("auto", "wayland", "x11", "none"), default="auto")
+    daemon.add_argument("--clipboard-interval", type=float, default=0.5)
+    daemon.add_argument("--max-file-size", type=int, default=MAX_FILE)
+    daemon.add_argument("--allow-peer-uid", type=int, action="append", default=[])
+    daemon.add_argument("--guest-uid", type=int, action="append", default=[])
+    status = sub.add_parser("status")
+    add_common(status)
+    send = sub.add_parser("send")
+    add_common(send)
+    send.add_argument("path")
+    install = sub.add_parser("install")
+    add_common(install)
+    install.add_argument("apks", nargs="+")
+    install.add_argument("--yes", action="store_true")
+    cancel = sub.add_parser("cancel")
+    add_common(cancel)
+    cancel.add_argument("transfer_id")
+    launch = sub.add_parser("launch")
+    add_common(launch)
+    launch.add_argument("--action", dest="intent_action",
+                        default="android.intent.action.VIEW")
+    launch.add_argument("--uri")
+    launch.add_argument("--type")
+    launch.add_argument("--package")
+    diagnose = sub.add_parser("diagnose")
+    add_common(diagnose)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        if args.socket is None:
+            args.socket = str(default_socket())
+        if args.action == "daemon":
+            if not args.allow_peer_uid:
+                args.allow_peer_uid = sorted({os.getuid()} | SYSTEM_GUEST_UIDS)
+            if not args.guest_uid:
+                args.guest_uid = sorted(SYSTEM_GUEST_UIDS)
+            asyncio.run(Daemon(args).run())
+        elif args.action == "status":
+            value = asyncio.run(request(args, {"op": "status"}))
+            print(json.dumps({key: item for key, item in value.items()
+                              if key not in ("id", "version")}, indent=2,
+                             sort_keys=True))
+        elif args.action == "send":
+            transfer_id = asyncio.run(send_file(args, args.path))
+            print("transfer-id: " + transfer_id)
+        elif args.action == "cancel":
+            value = asyncio.run(request(args, {"op": "transfer.cancel",
+                                               "transfer_id": args.transfer_id}))
+            print("state: " + value["state"])
+        elif args.action == "launch":
+            intent = {"op": "intent.launch", "action": args.intent_action}
+            for key in ("uri", "type", "package"):
+                item = getattr(args, key)
+                if item:
+                    intent[key] = item
+            value = asyncio.run(request(args, {"op": "guest.forward",
+                                               "message": intent}))
+            print("forwarded: " + str(value["forwarded"]).lower())
+        elif args.action == "diagnose":
+            value = asyncio.run(request(args, {"op": "guest.forward",
+                                               "message": {"op": "diagnostics.request"}}))
+            print("forwarded: " + str(value["forwarded"]).lower())
+        elif args.action == "install":
+            preflight = package_preflight(args.apks, args.data_dir)
+            show_preflight(preflight)
+            sys.stdout.flush()
+            if not preflight["compatible"]:
+                raise BridgeError(preflight["reason"])
+            if not args.yes:
+                if not sys.stdin.isatty() or input("Install selected APKs? [y/N] ").lower() not in ("y", "yes"):
+                    raise BridgeError("installation cancelled")
+            # Files are sent individually under one installation id. The guest
+            # service commits PackageInstaller only after every checksum passes.
+            install_id = str(uuid.uuid4())
+            selected = preflight["selected"]
+            for index, item in enumerate(selected):
+                asyncio.run(send_file(args, item["path"], "package.part", {
+                    "install_id": install_id, "index": index,
+                    "count": len(selected), "preflight": preflight if index == 0 else None,
+                }))
+            print("installation-id: " + install_id)
+            print("state: submitted")
+        return 0
+    except (BridgeError, OSError, ValueError, asyncio.TimeoutError) as error:
+        print("Error: " + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

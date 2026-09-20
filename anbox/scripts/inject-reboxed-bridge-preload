@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+IMAGE="${1:-}"
+APK="${2:-}"
+PRIVAPP_XML="${3:-}"
+SHARED_UID_XML="${4:-}"
+VERIFY_TOOL="${5:-}"
+BACKUP="${ANBOX_REBOXED_BRIDGE_IMAGE_BACKUP:-}"
+SKIP_BACKUP="${ANBOX_REBOXED_BRIDGE_SKIP_BACKUP:-}"
+PACKAGE=org.anbox.reboxed.bridge
+APK_PATH=/system/priv-app/ReboxedBridge/ReboxedBridge.apk
+APK_DIR=/system/priv-app/ReboxedBridge
+PRIVAPP_PATH=/system/etc/permissions/privapp-permissions-reboxed-bridge.xml
+SHARED_UID_PATH=/system/etc/permissions/package-shareduid-allowlist-reboxed-bridge.xml
+
+die() { echo "ERROR: Reboxed Bridge image injection failed: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command missing: $1"; }
+
+[[ -n "$IMAGE" && -n "$APK" && -n "$PRIVAPP_XML" && -n "$SHARED_UID_XML" && -n "$VERIFY_TOOL" ]] ||
+  die "usage: $0 <system.img> <ReboxedBridge.apk> <privapp.xml> <shareduid.xml> <verify-tool>"
+[[ -r "$IMAGE" && -w "$IMAGE" ]] || die "image must be readable and writable: $IMAGE"
+[[ -r "$APK" ]] || die "APK is unreadable: $APK"
+[[ -r "$PRIVAPP_XML" && -r "$SHARED_UID_XML" ]] || die "Bridge permission XML is unreadable"
+[[ -x "$VERIFY_TOOL" ]] || die "verification tool is not executable: $VERIFY_TOOL"
+need debugfs
+need keytool
+need cp
+need mv
+need mktemp
+need awk
+
+work="$(mktemp -d)"
+image_dir="$(dirname "$IMAGE")"
+image_base="$(basename "$IMAGE")"
+temp_image="$(mktemp "$image_dir/.${image_base}.reboxed-bridge.XXXXXX")"
+trap 'rm -rf "$work"; rm -f "$temp_image"' EXIT
+
+dump_file() {
+  local image="$1" source="$2" target="$3" output
+  output="$(debugfs -R "dump $source $target" "$image" 2>&1)"
+  [[ -s "$target" ]] || die "could not extract $source: $output"
+}
+
+apk_cert_sha256() {
+  keytool -printcert -jarfile "$1" 2>/dev/null |
+    awk '/SHA256:/{fingerprint=$2; gsub(":", "", fingerprint); print tolower(fingerprint); exit}'
+}
+
+dump_file "$IMAGE" /system/framework/framework-res.apk "$work/framework-res.apk"
+apk_cert="$(apk_cert_sha256 "$APK")"
+platform_cert="$(apk_cert_sha256 "$work/framework-res.apk")"
+[[ -n "$apk_cert" ]] || die "APK has no readable signing certificate: $APK"
+[[ -n "$platform_cert" ]] || die "image framework-res.apk has no readable platform certificate"
+[[ "$apk_cert" == "$platform_cert" ]] ||
+  die "APK signature does not match image platform certificate (apk=$apk_cert platform=$platform_cert)"
+
+if [[ -z "$BACKUP" ]]; then
+  BACKUP="$IMAGE.reboxed-bridge-original"
+fi
+case "$SKIP_BACKUP" in
+  ""|0|no|false) ;;
+  1|yes|true) BACKUP="" ;;
+  *) die "ANBOX_REBOXED_BRIDGE_SKIP_BACKUP must be 1, yes, or true" ;;
+esac
+if [[ -n "$BACKUP" && ! -e "$BACKUP" ]]; then
+  cp --reflink=auto --sparse=always --preserve=mode,timestamps "$IMAGE" "$BACKUP"
+fi
+cp --reflink=auto --sparse=always --preserve=mode,timestamps "$IMAGE" "$temp_image"
+
+commands="$work/debugfs.commands"
+printf 'mkdir %s\n' "$APK_DIR" >"$commands"
+printf 'rm %s\n' "$APK_PATH" >>"$commands"
+printf 'rm %s\n' "$PRIVAPP_PATH" >>"$commands"
+printf 'rm %s\n' "$SHARED_UID_PATH" >>"$commands"
+printf 'write %s %s\n' "$APK" "$APK_PATH" >>"$commands"
+printf 'write %s %s\n' "$PRIVAPP_XML" "$PRIVAPP_PATH" >>"$commands"
+printf 'write %s %s\n' "$SHARED_UID_XML" "$SHARED_UID_PATH" >>"$commands"
+printf 'set_inode_field %s mode 040755\n' "$APK_DIR" >>"$commands"
+printf 'set_inode_field %s uid 0\nset_inode_field %s gid 0\n' "$APK_DIR" "$APK_DIR" >>"$commands"
+for path in "$APK_PATH" "$PRIVAPP_PATH" "$SHARED_UID_PATH"; do
+  printf 'set_inode_field %s mode 0100644\n' "$path" >>"$commands"
+  printf 'set_inode_field %s uid 0\nset_inode_field %s gid 0\n' "$path" "$path" >>"$commands"
+done
+
+# Replacing an existing directory is idempotent: debugfs reports the mkdir
+# failure but continues to execute the remaining commands in the batch.
+debugfs -w -f "$commands" "$temp_image" >"$work/debugfs.log" 2>&1 ||
+  die "debugfs could not update the temporary image: $(tail -20 "$work/debugfs.log")"
+"$VERIFY_TOOL" "$temp_image"
+mv -f "$temp_image" "$IMAGE"
+temp_image=""
+echo "Reboxed Bridge injected atomically into $IMAGE"
+[[ -z "$BACKUP" ]] || echo "Original image backup: $BACKUP"

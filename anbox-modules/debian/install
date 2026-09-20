@@ -1,0 +1,2 @@
+ashmem usr/src/anbox-1
+anbox.conf /etc/modules-load.d/

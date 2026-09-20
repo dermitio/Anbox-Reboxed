@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "Usage: build-signature-spoof-permission SOURCE_DIR OUTPUT_APK SDK_ROOT" >&2
+  exit 2
+fi
+
+SOURCE_DIR="$(readlink -f -- "$1")"
+OUTPUT_APK="$2"
+SDK_ROOT="$(readlink -f -- "$3")"
+BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)"
+PLATFORM="$(find "$SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 -type d -name 'android-*' -printf '%f\n' | sort -V | tail -1)"
+TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS"
+ANDROID_JAR="$SDK_ROOT/platforms/$PLATFORM/android.jar"
+
+for path in "$TOOLS/aapt" "$TOOLS/apksigner" "$ANDROID_JAR"; do
+  [[ -x "$path" || "$path" == "$ANDROID_JAR" && -r "$path" ]] || {
+    echo "Signature permission build dependency is unavailable: $path" >&2
+    exit 1
+  }
+done
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$(dirname "$OUTPUT_APK")"
+"$TOOLS/aapt" package -f -M "$SOURCE_DIR/AndroidManifest.xml" \
+  -I "$ANDROID_JAR" -F "$WORK/unsigned.apk"
+
+KEYSTORE="$(dirname "$OUTPUT_APK")/signature-spoof-permission.p12"
+if [[ ! -f "$KEYSTORE" ]]; then
+  keytool -genkeypair -noprompt -storetype PKCS12 -keystore "$KEYSTORE" \
+    -storepass android -keypass android -alias reboxed-signature-permission \
+    -keyalg RSA -keysize 2048 -validity 36500 \
+    -dname 'CN=Anbox Reboxed Signature Permission,O=Local Build,C=XX' >/dev/null
+fi
+TEMP_OUTPUT="${OUTPUT_APK}.tmp"
+"$TOOLS/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android \
+  --ks-key-alias reboxed-signature-permission --out "$TEMP_OUTPUT" \
+  "$WORK/unsigned.apk"
+"$TOOLS/apksigner" verify "$TEMP_OUTPUT"
+mv -f "$TEMP_OUTPUT" "$OUTPUT_APK"

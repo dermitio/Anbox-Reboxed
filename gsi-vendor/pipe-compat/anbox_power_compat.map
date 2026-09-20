@@ -1,0 +1,6 @@
+LIBBINDER_NDK {
+    global:
+        AnboxBndr_Class_defin;
+    local:
+        *;
+};
