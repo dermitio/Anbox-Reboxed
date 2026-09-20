@@ -16,7 +16,7 @@ This project is not affiliated with, endorsed by, or maintained by Canonical, th
 The combined Reboxed project is licensed under **GPL-3.0-only**, following
 the inherited Anbox core's explicit version-3 grant. Project-owned additions
 use that license unless explicitly stated otherwise. Existing per-file and
-third-party licenses remain intact; see [LICENSE](LICENSE) and
+third-party licenses remain intact see [LICENSE](LICENSE) and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Why?
